@@ -95,7 +95,8 @@ internal sealed class TrayApplication : ApplicationContext
         if (!popup.Visible)
         {
             NativeMethods.GetCursorPos(out var cursor);
-            popup.ShowNear(cursor);
+            TrayIconBounds.TryGetScreenBounds(trayIcon, out var iconBounds);
+            popup.ShowNear(cursor, iconBounds);
         }
     }
 
@@ -170,6 +171,12 @@ internal sealed class PopupWindow : Form
     private static int BarHeight => DpiScaling.Scale(6);
     private static int GapBarToContent => DpiScaling.Scale(8);
     private static int HeaderHeight => HeaderTop + TitleRowHeight + GapTitleToBar + BarHeight + GapBarToContent;
+    private const int ArrowWidth = 20;
+    private const int ArrowHeight = 10;
+    private const int ArrowGap = 4;
+    private static int ArrowWidthScaled => DpiScaling.Scale(ArrowWidth);
+    private static int ArrowHeightScaled => DpiScaling.Scale(ArrowHeight);
+    private static int ArrowGapScaled => DpiScaling.Scale(ArrowGap);
 
     private readonly Label title = new() { AutoSize = false, Font = new Font("Segoe UI Semibold", 10f), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft };
     private readonly Label usage = new() { AutoSize = false, Font = new Font("Segoe UI", 9f), ForeColor = Color.FromArgb(210, 218, 230), TextAlign = ContentAlignment.MiddleRight };
@@ -177,6 +184,7 @@ internal sealed class PopupWindow : Form
     private readonly Panel barFill = new();
     private readonly DoubleBufferedPanel processes = new() { AutoScroll = false, BackColor = Color.Transparent };
     private readonly Label empty = new() { AutoSize = false, ForeColor = Color.FromArgb(167, 177, 191), Font = new Font("Segoe UI", 9f), TextAlign = ContentAlignment.MiddleCenter };
+    private int arrowX;
 
     public PopupWindow()
     {
@@ -220,23 +228,41 @@ internal sealed class PopupWindow : Form
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
+        UpdateRegion();
+    }
+
+    private void UpdateRegion()
+    {
         var path = new GraphicsPath();
         var radius = DpiScaling.Scale(8);
+        var bodyHeight = Height - ArrowHeightScaled;
         path.AddArc(0, 0, radius * 2, radius * 2, 180, 90);
         path.AddArc(Width - radius * 2, 0, radius * 2, radius * 2, 270, 90);
-        path.AddArc(Width - radius * 2, Height - radius * 2, radius * 2, radius * 2, 0, 90);
-        path.AddArc(0, Height - radius * 2, radius * 2, radius * 2, 90, 90);
+        path.AddArc(Width - radius * 2, bodyHeight - radius * 2, radius * 2, radius * 2, 0, 90);
+        path.AddArc(0, bodyHeight - radius * 2, radius * 2, radius * 2, 90, 90);
+        path.CloseFigure();
+        var arrowLeft = arrowX - ArrowWidthScaled / 2;
+        var arrowTop = bodyHeight;
+        path.AddPolygon(new[]
+        {
+            new Point(arrowLeft, arrowTop),
+            new Point(arrowLeft + ArrowWidthScaled, arrowTop),
+            new Point(arrowX, arrowTop + ArrowHeightScaled)
+        });
         path.CloseFigure();
         Region = new Region(path);
     }
 
-    public void ShowNear(NativeMethods.POINT cursor)
+    public void ShowNear(NativeMethods.POINT cursor, Rectangle iconBounds)
     {
         var screen = Screen.FromPoint(new Point(cursor.X, cursor.Y)).WorkingArea;
-        var x = Math.Clamp(cursor.X - Width + DpiScaling.Scale(24), screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
-        var y = cursor.Y - Height - DpiScaling.Scale(10);
-        if (y < screen.Top + DpiScaling.Scale(6)) y = cursor.Y + DpiScaling.Scale(10);
+        var iconCenterX = iconBounds.Width > 0 ? iconBounds.Left + iconBounds.Width / 2 : cursor.X;
+        var x = Math.Clamp(iconCenterX - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
+        arrowX = Math.Clamp(iconCenterX - x, ArrowWidthScaled / 2 + DpiScaling.Scale(4), Width - ArrowWidthScaled / 2 - DpiScaling.Scale(4));
+        var y = screen.Bottom - Height - ArrowGapScaled;
+        if (y < screen.Top + DpiScaling.Scale(6)) y = screen.Top + DpiScaling.Scale(6);
         Location = new Point(x, y);
+        UpdateRegion();
         Show();
         NativeMethods.ShowWindow(Handle, 4); // SW_SHOWNOACTIVATE
     }
@@ -267,7 +293,7 @@ internal sealed class PopupWindow : Form
                 ? "No process data is available from the GPU driver."
                 : "The NVIDIA driver tool did not respond.\nCheck whether nvidia-smi runs from Command Prompt.";
             if (empty.Text != emptyText) empty.Text = emptyText;
-            Height = HeaderHeight + empty.Height + DpiScaling.Scale(14);
+            Height = HeaderHeight + empty.Height + DpiScaling.Scale(14) + ArrowHeightScaled;
         }
         else
         {
@@ -279,19 +305,19 @@ internal sealed class PopupWindow : Form
 
             NativeMethods.GetCursorPos(out var cursor);
             var screen = Screen.FromPoint(new Point(cursor.X, cursor.Y)).WorkingArea;
-            var maxContentHeight = screen.Height - HeaderHeight - DpiScaling.Scale(40);
+            var maxContentHeight = screen.Height - HeaderHeight - DpiScaling.Scale(40) - ArrowHeightScaled;
 
             if (totalProcessHeight > maxContentHeight)
             {
                 processes.AutoScroll = true;
                 processes.Size = new Size(388, maxContentHeight);
-                Height = HeaderHeight + maxContentHeight + DpiScaling.Scale(14);
+                Height = HeaderHeight + maxContentHeight + DpiScaling.Scale(14) + ArrowHeightScaled;
             }
             else
             {
                 processes.AutoScroll = false;
                 processes.Size = new Size(388, totalProcessHeight);
-                Height = HeaderHeight + totalProcessHeight + DpiScaling.Scale(14);
+                Height = HeaderHeight + totalProcessHeight + DpiScaling.Scale(14) + ArrowHeightScaled;
             }
 
             // Remove extra rows if count decreased
