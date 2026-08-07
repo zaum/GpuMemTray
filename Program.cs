@@ -173,7 +173,7 @@ internal sealed class PopupWindow : Form
     private static int HeaderHeight => HeaderTop + TitleRowHeight + GapTitleToBar + BarHeight + GapBarToContent;
     private const int ArrowWidth = 20;
     private const int ArrowHeight = 10;
-    private const int ArrowGap = 14;
+    private const int ArrowGap = 40;
     private static int ArrowWidthScaled => DpiScaling.Scale(ArrowWidth);
     private static int ArrowHeightScaled => DpiScaling.Scale(ArrowHeight);
     private static int ArrowGapScaled => DpiScaling.Scale(ArrowGap);
@@ -259,7 +259,9 @@ internal sealed class PopupWindow : Form
         var iconCenterX = iconBounds.Width > 0 ? iconBounds.Left + iconBounds.Width / 2 : cursor.X;
         var x = Math.Clamp(iconCenterX - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
         arrowX = Math.Clamp(iconCenterX - x, ArrowWidthScaled / 2 + DpiScaling.Scale(4), Width - ArrowWidthScaled / 2 - DpiScaling.Scale(4));
-        var y = screen.Bottom - Height - ArrowGapScaled;
+        var y = iconBounds.Height > 0
+            ? iconBounds.Top - Height - ArrowGapScaled
+            : screen.Bottom - Height - ArrowGapScaled;
         if (y < screen.Top + DpiScaling.Scale(6)) y = screen.Top + DpiScaling.Scale(6);
         Location = new Point(x, y);
         UpdateRegion();
