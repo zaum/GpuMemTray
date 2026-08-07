@@ -48,7 +48,7 @@ internal sealed class TrayApplication : ApplicationContext
 
     private ContextMenuStrip BuildMenu()
     {
-        var menu = new ContextMenuStrip { ShowImageMargin = false };
+        var menu = new ContextMenuStrip { ShowImageMargin = true };
         var showPercent = new ToolStripMenuItem("Show percentage in icon") { Checked = settings.ShowPercentage, CheckOnClick = true };
         showPercent.CheckedChanged += (_, _) =>
         {
@@ -58,15 +58,10 @@ internal sealed class TrayApplication : ApplicationContext
         };
         var startup = new ToolStripMenuItem("Start with Windows") { Checked = StartupManager.IsEnabled(), CheckOnClick = true };
         startup.CheckedChanged += (_, _) => StartupManager.SetEnabled(startup.Checked);
-        var refresh = new ToolStripMenuItem("Refresh now");
-        refresh.Click += async (_, _) => await RefreshAsync();
         var exit = new ToolStripMenuItem("Quit");
         exit.Click += (_, _) => Exit();
-        menu.Items.Add("GPU Memory Monitor").Enabled = false;
-        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(showPercent);
         menu.Items.Add(startup);
-        menu.Items.Add(refresh);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exit);
         return menu;

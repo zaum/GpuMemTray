@@ -72,7 +72,7 @@ internal static class TrayIconFactory
         {
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             var text = percent.ToString();
-            using var font = new Font("Segoe UI", percent == 100 ? 10 : 12, FontStyle.Bold, GraphicsUnit.Pixel);
+            using var font = new Font("Segoe UI", percent == 100 ? 12 : 15, FontStyle.Bold, GraphicsUnit.Pixel);
             using var textBrush = new SolidBrush(Color.White);
             var size = g.MeasureString(text, font);
             g.DrawString(text, font, textBrush, 16 - size.Width / 2, 16 - size.Height / 2 - 1);
