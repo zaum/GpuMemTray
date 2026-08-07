@@ -173,7 +173,7 @@ internal sealed class PopupWindow : Form
     private static int HeaderHeight => HeaderTop + TitleRowHeight + GapTitleToBar + BarHeight + GapBarToContent;
     private const int ArrowWidth = 20;
     private const int ArrowHeight = 10;
-    private const int ArrowGap = 4;
+    private const int ArrowGap = 14;
     private static int ArrowWidthScaled => DpiScaling.Scale(ArrowWidth);
     private static int ArrowHeightScaled => DpiScaling.Scale(ArrowHeight);
     private static int ArrowGapScaled => DpiScaling.Scale(ArrowGap);
