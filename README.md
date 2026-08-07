@@ -11,7 +11,7 @@ A small Windows tray application for monitoring NVIDIA GPU memory. Hovering over
 Start-Process .\bin\Release\net8.0-windows\publish\GpuMemTray.exe
 ```
 
-The application requires access to the `nvidia-smi` command (installed by the NVIDIA driver). The right-click menu allows toggling the percentage icon and automatic Windows startup.
+The application uses the `nvidia-smi` command (installed by the NVIDIA driver) when available, and falls back to Windows' `GPU Process Memory` performance counter if it is not. The right-click menu allows toggling the percentage icon and automatic Windows startup.
 
 ## Note
 
