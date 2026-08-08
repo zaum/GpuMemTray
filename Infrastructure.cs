@@ -1,8 +1,10 @@
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace GpuMemTray;
@@ -55,6 +57,73 @@ internal static class DpiScaling
         Scale(padding.Left), Scale(padding.Top), Scale(padding.Right), Scale(padding.Bottom));
 }
 
+internal static class SvgIconPath
+{
+    // The first subpath (outer outline) of img/icon.svg with its
+    // viewBox transform applied: matrix(1.01601,0,0,1.117483,-1.600954,-13.594109)
+    private const string GpuOutline =
+        "M11.369,83.536L11.369,19.071L4.994,19.071" +
+        "C3.108,19.071 1.576,17.679 1.576,15.963" +
+        "C1.576,14.248 3.108,12.855 4.994,12.855" +
+        "L18.207,12.855L18.207,26.107L89.266,26.107" +
+        "C95.19,26.107 100,30.479 100,35.865L100,63.443" +
+        "C100,68.829 95.19,73.202 89.266,73.202L18.207,73.202" +
+        "L18.207,83.536C18.207,85.251 16.675,86.644 14.788,86.644" +
+        "C12.901,86.644 11.369,85.251 11.369,83.536Z";
+
+    public static GraphicsPath CreateGpu(RectangleF target)
+    {
+        var tokens = Regex.Matches(GpuOutline, @"[A-Za-z]|[-+]?(?:\d*\.)?\d+")
+            .Select(m => m.Value).ToList();
+
+        var path = new GraphicsPath();
+        PointF current = default;
+        var i = 0;
+        while (i < tokens.Count)
+        {
+            switch (tokens[i++])
+            {
+                case "M":
+                    current = ReadPoint(tokens, ref i);
+                    path.StartFigure();
+                    break;
+                case "L":
+                    var lineEnd = ReadPoint(tokens, ref i);
+                    path.AddLine(current, lineEnd);
+                    current = lineEnd;
+                    break;
+                case "C":
+                    var c1 = ReadPoint(tokens, ref i);
+                    var c2 = ReadPoint(tokens, ref i);
+                    var curveEnd = ReadPoint(tokens, ref i);
+                    path.AddBezier(current, c1, c2, curveEnd);
+                    current = curveEnd;
+                    break;
+            }
+        }
+        path.CloseFigure();
+
+        var bounds = path.GetBounds();
+        var scale = Math.Min(target.Width / bounds.Width, target.Height / bounds.Height);
+        using var matrix = new Matrix();
+        matrix.Translate(-bounds.X, -bounds.Y);
+        matrix.Scale(scale, scale, MatrixOrder.Append);
+        matrix.Translate(
+            target.X + (target.Width - bounds.Width * scale) / 2f,
+            target.Y + (target.Height - bounds.Height * scale) / 2f,
+            MatrixOrder.Append);
+        path.Transform(matrix);
+        return path;
+    }
+
+    private static PointF ReadPoint(List<string> tokens, ref int i)
+    {
+        var x = float.Parse(tokens[i++], CultureInfo.InvariantCulture);
+        var y = float.Parse(tokens[i++], CultureInfo.InvariantCulture);
+        return new PointF(1.01601f * x - 1.600954f, 1.117483f * y - 13.594109f);
+    }
+}
+
 internal static class TrayIconFactory
 {
     public static Icon Create(int percent, bool showPercent)
@@ -65,14 +134,13 @@ internal static class TrayIconFactory
         g.Clear(Color.Transparent);
         var color = percent < 60 ? Color.FromArgb(56, 183, 117) : percent < 85 ? Color.FromArgb(231, 169, 51) : Color.FromArgb(224, 73, 73);
         using var brush = new SolidBrush(color);
-        using var border = new Pen(Color.FromArgb(235, 240, 245), 2);
-        g.FillRoundedRectangle(brush, new Rectangle(2, 5, 28, 22), 5);
-        g.DrawRoundedRectangle(border, new Rectangle(2, 5, 28, 22), 5);
+        using var gpu = SvgIconPath.CreateGpu(new RectangleF(0.5f, 0.5f, 31, 31));
+        g.FillPath(brush, gpu);
         if (showPercent)
         {
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             var text = percent.ToString();
-            using var font = new Font("Segoe UI", percent == 100 ? 12 : 15, FontStyle.Bold, GraphicsUnit.Pixel);
+            using var font = new Font("Segoe UI", percent == 100 ? 16 : 21, FontStyle.Bold, GraphicsUnit.Pixel);
             using var textBrush = new SolidBrush(Color.White);
             var size = g.MeasureString(text, font);
             g.DrawString(text, font, textBrush, 16 - size.Width / 2, 16 - size.Height / 2 - 1);
@@ -80,30 +148,14 @@ internal static class TrayIconFactory
         else
         {
             using var fill = new SolidBrush(Color.FromArgb(245, 250, 253));
-            var width = (int)Math.Round(20 * percent / 100d);
-            g.FillRectangle(fill, 6, 19 - Math.Min(12, width / 2), width, Math.Min(12, width / 2));
+            var width = (int)Math.Round(22 * percent / 100d);
+            g.FillRectangle(fill, 5, 25, width, 3);
         }
         var handle = bitmap.GetHicon();
         using var temporary = Icon.FromHandle(handle);
         var icon = (Icon)temporary.Clone();
         NativeMethods.DestroyIcon(handle);
         return icon;
-    }
-
-    private static void FillRoundedRectangle(this Graphics graphics, Brush brush, Rectangle bounds, int radius)
-    {
-        using var path = RoundedPath(bounds, radius); graphics.FillPath(brush, path);
-    }
-    private static void DrawRoundedRectangle(this Graphics graphics, Pen pen, Rectangle bounds, int radius)
-    {
-        using var path = RoundedPath(bounds, radius); graphics.DrawPath(pen, path);
-    }
-    private static GraphicsPath RoundedPath(Rectangle b, int r)
-    {
-        var d = r * 2; var path = new GraphicsPath();
-        path.AddArc(b.Left, b.Top, d, d, 180, 90); path.AddArc(b.Right - d, b.Top, d, d, 270, 90);
-        path.AddArc(b.Right - d, b.Bottom - d, d, d, 0, 90); path.AddArc(b.Left, b.Bottom - d, d, d, 90, 90); path.CloseFigure();
-        return path;
     }
 }
 
