@@ -21,15 +21,19 @@ internal sealed class TrayApplication : ApplicationContext
     private readonly NotifyIcon trayIcon;
     private readonly PopupWindow popup;
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1500 };
-    private readonly System.Windows.Forms.Timer hoverTimer = new() { Interval = 180 };
+    private readonly System.Windows.Forms.Timer hoverTimer = new() { Interval = 100 };
     private readonly AppSettings settings = AppSettings.Load();
     private bool querying;
+    private bool refreshPending;
     private bool exiting;
+    private int outsideTicks;
+    private Rectangle lastIconBounds;
     private GpuSnapshot snapshot = GpuSnapshot.Empty;
 
     public TrayApplication()
     {
         popup = new PopupWindow();
+        popup.ProcessKilled += () => _ = RefreshAsync();
         trayIcon = new NotifyIcon
         {
             Visible = true,
@@ -69,8 +73,13 @@ internal sealed class TrayApplication : ApplicationContext
 
     private async Task RefreshAsync()
     {
-        if (querying || exiting) return;
+        if (querying || exiting)
+        {
+            refreshPending = true;
+            return;
+        }
         querying = true;
+        refreshPending = false;
         try
         {
             snapshot = await Task.Run(NvidiaSmi.Read);
@@ -79,7 +88,11 @@ internal sealed class TrayApplication : ApplicationContext
             UpdateTrayIcon();
         }
         catch { /* The popup displays a useful driver-not-found state. */ }
-        finally { querying = false; }
+        finally
+        {
+            querying = false;
+            if (refreshPending) _ = RefreshAsync();
+        }
     }
 
     private void UpdateTrayIcon()
@@ -95,7 +108,7 @@ internal sealed class TrayApplication : ApplicationContext
         if (!popup.Visible)
         {
             NativeMethods.GetCursorPos(out var cursor);
-            TrayIconBounds.TryGetScreenBounds(trayIcon, out var iconBounds);
+            TryGetIconBounds(out var iconBounds, 0);
             popup.ShowNear(cursor, iconBounds);
         }
     }
@@ -109,10 +122,12 @@ internal sealed class TrayApplication : ApplicationContext
 
         if (popup.Visible)
         {
-            if (!ContainsCursor(cursor)) popup.Hide();
+            if (ContainsCursor(cursor)) { outsideTicks = 0; return; }
+            if (++outsideTicks >= 2) { outsideTicks = 0; popup.Hide(); }
             return;
         }
 
+        outsideTicks = 0;
         if (IsOverTrayIcon(cursor)) ShowPopup();
     }
 
@@ -122,9 +137,8 @@ internal sealed class TrayApplication : ApplicationContext
         var zone = popup.Bounds;
         zone.Inflate(padding, padding);
 
-        if (TrayIconBounds.TryGetScreenBounds(trayIcon, out var iconBounds))
+        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(24)))
         {
-            iconBounds.Inflate(padding, padding);
             zone = Rectangle.Union(zone, iconBounds);
         }
 
@@ -133,9 +147,28 @@ internal sealed class TrayApplication : ApplicationContext
 
     private bool IsOverTrayIcon(Point screenPoint)
     {
-        if (!TrayIconBounds.TryGetScreenBounds(trayIcon, out var iconBounds)) return false;
-        iconBounds.Inflate(DpiScaling.Scale(8), DpiScaling.Scale(8));
-        return iconBounds.Contains(screenPoint);
+        return TryGetIconBounds(out var iconBounds, DpiScaling.Scale(16))
+            && iconBounds.Contains(screenPoint);
+    }
+
+    private bool TryGetIconBounds(out Rectangle bounds, int inflate)
+    {
+        if (TrayIconBounds.TryGetScreenBounds(trayIcon, out var current))
+        {
+            lastIconBounds = current;
+            bounds = current;
+        }
+        else if (lastIconBounds.Width > 0)
+        {
+            bounds = lastIconBounds;
+        }
+        else
+        {
+            bounds = default;
+            return false;
+        }
+        bounds.Inflate(inflate, inflate);
+        return true;
     }
 
     private void Exit()
@@ -184,6 +217,7 @@ internal sealed class PopupWindow : Form
     private readonly Panel barFill = new();
     private readonly DoubleBufferedPanel processes = new() { AutoScroll = false, BackColor = Color.Transparent };
     private readonly Label empty = new() { AutoSize = false, ForeColor = Color.FromArgb(167, 177, 191), Font = new Font("Segoe UI", 9f), TextAlign = ContentAlignment.MiddleCenter };
+    public event Action? ProcessKilled;
     private int arrowX;
 
     public PopupWindow()
@@ -256,9 +290,10 @@ internal sealed class PopupWindow : Form
     public void ShowNear(NativeMethods.POINT cursor, Rectangle iconBounds)
     {
         var screen = Screen.FromPoint(new Point(cursor.X, cursor.Y)).WorkingArea;
-        var iconCenterX = iconBounds.Width > 0 ? iconBounds.Left + iconBounds.Width / 2 : cursor.X;
-        var x = Math.Clamp(iconCenterX - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
-        arrowX = Math.Clamp(iconCenterX - x, ArrowWidthScaled / 2 + DpiScaling.Scale(4), Width - ArrowWidthScaled / 2 - DpiScaling.Scale(4));
+        // The arrow is always centered in the popup. The popup is centered on the cursor
+        // (which is over the tray icon when the popup appears).
+        var x = Math.Clamp(cursor.X - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
+        arrowX = Width / 2;
         var y = iconBounds.Height > 0
             ? iconBounds.Top - Height - ArrowGapScaled
             : screen.Bottom - Height - ArrowGapScaled;
@@ -347,6 +382,7 @@ internal sealed class PopupWindow : Form
                         Location = new Point(0, i * RowHeight),
                         Width = processes.ClientSize.Width
                     };
+                    newRow.ProcessKilled += () => ProcessKilled?.Invoke();
                     processes.Controls.Add(newRow);
                 }
             }
@@ -364,29 +400,87 @@ internal sealed class ProcessRow : DoubleBufferedPanel
 {
     private string name;
     private string memory;
+    private int? pid;
+    private bool hoverKill;
     private readonly Font nameFont = new Font("Segoe UI", 9f);
     private readonly Font memoryFont = new Font("Segoe UI Semibold", 9f);
+    private readonly Font killFont = new Font("Segoe UI", 10f);
+    private static readonly StringFormat CenterFormat = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+    private Rectangle KillBounds => new(Width - 32, 0, 32, Height);
+    public event Action? ProcessKilled;
 
     public ProcessRow(GpuProcess process)
     {
         Size = new Size(388, DpiScaling.Scale(26));
         Margin = Padding.Empty;
-        name = process.Name;
-        memory = FormatMemory(process.MemoryMiB);
+        UpdateData(process);
         Paint += OnPaint;
+        MouseMove += OnMouseMove;
+        MouseLeave += OnMouseLeave;
+        MouseClick += OnMouseClick;
     }
 
     private void OnPaint(object? sender, PaintEventArgs e)
     {
         e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        e.Graphics.DrawString(name, nameFont, new SolidBrush(Color.FromArgb(232, 236, 242)), new RectangleF(6, DpiScaling.Scale(4), 286, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter });
-        e.Graphics.DrawString(memory, memoryFont, new SolidBrush(Color.FromArgb(150, 202, 255)), new RectangleF(294, DpiScaling.Scale(4), 88, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });
+        e.Graphics.DrawString(name, nameFont, new SolidBrush(Color.FromArgb(232, 236, 242)), new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter });
+        e.Graphics.DrawString(memory, memoryFont, new SolidBrush(Color.FromArgb(150, 202, 255)), new RectangleF(254, DpiScaling.Scale(4), 94, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });
+
+        if (pid is null) return;
+
+        var bounds = KillBounds;
+        if (hoverKill)
+        {
+            using var hoverBg = new SolidBrush(Color.FromArgb(232, 83, 83));
+            e.Graphics.FillRectangle(hoverBg, bounds);
+        }
+        using var killBrush = new SolidBrush(hoverKill ? Color.White : Color.FromArgb(150, 160, 175));
+        e.Graphics.DrawString("✕", killFont, killBrush, bounds, CenterFormat);
+    }
+
+    private void OnMouseMove(object? sender, MouseEventArgs e)
+    {
+        var overKill = pid is not null && KillBounds.Contains(e.Location);
+        if (hoverKill != overKill)
+        {
+            hoverKill = overKill;
+            Invalidate();
+        }
+    }
+
+    private void OnMouseLeave(object? sender, EventArgs e)
+    {
+        if (hoverKill)
+        {
+            hoverKill = false;
+            Invalidate();
+        }
+    }
+
+    private void OnMouseClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && pid is int p && KillBounds.Contains(e.Location))
+        {
+            TryKill(p);
+            ProcessKilled?.Invoke();
+        }
+    }
+
+    private static void TryKill(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            process.Kill();
+        }
+        catch { /* Process already exited or access is denied. */ }
     }
 
     public void UpdateData(GpuProcess process)
     {
         name = process.Name;
         memory = FormatMemory(process.MemoryMiB);
+        pid = process.Pid;
         Invalidate();
     }
 

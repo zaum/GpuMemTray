@@ -72,7 +72,7 @@ internal static class NvidiaSmi
         if (parts.Length < 2) return null;
         var executable = parts[1].Replace('\\', '/').Split('/').LastOrDefault() ?? parts[1];
         var memText = parts.Length > 2 ? parts[2].Replace("[", "").Replace("]", "").Trim() : "";
-        return new GpuProcess(executable, int.TryParse(memText, out var mib) ? mib : null);
+        return new GpuProcess(executable, int.TryParse(memText, out var mib) ? mib : null, int.TryParse(parts[0], out var pid) ? pid : null);
     }
 
     private static List<GpuProcess> ReadWindowsProcessMemory()
@@ -86,7 +86,7 @@ internal static class NvidiaSmi
                 .Select(parts => new { Pid = ParsePid(parts[0]), Memory = int.Parse(parts[1]) })
                 .Where(x => x.Pid is not null)
                 .GroupBy(x => x.Pid!.Value)
-                .Select(group => new GpuProcess(ProcessName(group.Key), group.Sum(x => x.Memory)))
+                .Select(group => new GpuProcess(ProcessName(group.Key), group.Sum(x => x.Memory), group.Key))
                 .OrderByDescending(x => x.MemoryMiB).ToList();
         }
         catch { return []; }
@@ -114,7 +114,7 @@ internal static class NvidiaSmi
     }
 }
 
-internal sealed record GpuProcess(string Name, int? MemoryMiB);
+internal sealed record GpuProcess(string Name, int? MemoryMiB, int? Pid);
 
 internal sealed record GpuSnapshot(int UsedMiB, int TotalMiB, IReadOnlyList<GpuProcess> Processes, bool Available)
 {
