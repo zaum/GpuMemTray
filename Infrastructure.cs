@@ -167,7 +167,11 @@ internal static class TrayIconBounds
         if (!TryGetIdentifier(icon, out var id)) return false;
         if (NativeMethods.Shell_NotifyIconGetRect(ref id, out var rect) != 0) return false;
         bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
-        return bounds.Width > 0 && bounds.Height > 0;
+        if (bounds.Width <= 0 || bounds.Height <= 0 || bounds.Width > 128 || bounds.Height > 128) return false;
+        // Reject stale or virtualized rectangles that are not on any monitor.
+        var candidate = bounds;
+        if (!Screen.AllScreens.Any(s => s.Bounds.IntersectsWith(candidate))) return false;
+        return true;
     }
 
     private static bool TryGetIdentifier(NotifyIcon icon, out NativeMethods.NOTIFYICONIDENTIFIER id)

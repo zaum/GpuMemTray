@@ -28,6 +28,9 @@ internal sealed class TrayApplication : ApplicationContext
     private bool exiting;
     private int outsideTicks;
     private Rectangle lastIconBounds;
+    private Point lastShellHover;
+    private long lastShellHoverStamp = long.MinValue;
+    private const int ShellHoverGraceMs = 1500;
     private GpuSnapshot snapshot = GpuSnapshot.Empty;
 
     public TrayApplication()
@@ -41,7 +44,18 @@ internal sealed class TrayApplication : ApplicationContext
             ContextMenuStrip = BuildMenu(),
             Icon = TrayIconFactory.Create(0, settings.ShowPercentage)
         };
-        trayIcon.MouseMove += (_, _) => ShowPopup();
+        trayIcon.MouseMove += (_, _) =>
+        {
+            // The shell only forwards mouse-move messages while the cursor is
+            // over the icon, so this point is a reliable anchor even when
+            // Shell_NotifyIconGetRect reports an inaccurate rectangle.
+            if (NativeMethods.GetCursorPos(out var p))
+            {
+                lastShellHover = new Point(p.X, p.Y);
+                lastShellHoverStamp = Environment.TickCount64;
+            }
+            ShowPopup();
+        };
         trayIcon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowPopup(); };
         refreshTimer.Tick += async (_, _) => await RefreshAsync();
         hoverTimer.Tick += (_, _) => UpdatePopupHoverState();
@@ -142,13 +156,34 @@ internal sealed class TrayApplication : ApplicationContext
             zone = Rectangle.Union(zone, iconBounds);
         }
 
+        if (HasRecentShellHover)
+        {
+            zone = Rectangle.Union(zone, ShellHoverZone());
+        }
+
         return zone.Contains(screenPoint);
     }
 
     private bool IsOverTrayIcon(Point screenPoint)
     {
-        return TryGetIconBounds(out var iconBounds, DpiScaling.Scale(16))
-            && iconBounds.Contains(screenPoint);
+        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(16)) && iconBounds.Contains(screenPoint))
+        {
+            return true;
+        }
+
+        // Fallback for cases where the shell-queried rectangle is missing or
+        // inaccurate (Windows 11 taskbar quirks): trust the last position the
+        // shell itself reported as cursor over the icon.
+        return HasRecentShellHover && ShellHoverZone().Contains(screenPoint);
+    }
+
+    private bool HasRecentShellHover =>
+        Environment.TickCount64 - lastShellHoverStamp <= ShellHoverGraceMs;
+
+    private Rectangle ShellHoverZone()
+    {
+        var radius = DpiScaling.Scale(16);
+        return new Rectangle(lastShellHover.X - radius, lastShellHover.Y - radius, radius * 2, radius * 2);
     }
 
     private bool TryGetIconBounds(out Rectangle bounds, int inflate)
