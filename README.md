@@ -2,7 +2,7 @@
 
 A small Windows tray application for monitoring NVIDIA GPU memory. Hovering over the icon shows a dark panel with total VRAM usage, a colored saturation bar, and a list of GPU processes sorted by memory usage.
 
-![GPU Memory Tray screenshot](img/screenshot.png)
+![GPU Memory Tray screenshot](img/screenshot.jpg)
 
 ## Build and Run
 
