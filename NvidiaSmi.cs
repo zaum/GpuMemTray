@@ -102,12 +102,23 @@ internal static class NvidiaSmi
         return new GpuProcess(executable, int.TryParse(memText, out var mib) ? mib : null, int.TryParse(parts[0], out var pid) ? pid : null);
     }
 
+    // Backoff for the performance-counter fallback below: on machines where
+    // Get-Counter hangs (broken counter library, localized builds), each poll
+    // would otherwise spawn a powershell.exe that runs into the 4s timeout and
+    // gets killed - serializing every refresh behind a dead 4s+ wait.
+    private static DateTime lastCounterAttempt = DateTime.MinValue;
+    private static TimeSpan counterBackoff = TimeSpan.Zero;
+
     private static List<GpuProcess> ReadWindowsProcessMemory()
     {
+        var now = DateTime.UtcNow;
+        if (now - lastCounterAttempt < counterBackoff) return [];
+        lastCounterAttempt = now;
         const string script = "(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage').CounterSamples | Where-Object {$_.CookedValue -gt 0} | ForEach-Object { '{0}|{1}' -f $_.InstanceName,[math]::Round($_.CookedValue / 1MB) }";
+        var sw = Stopwatch.StartNew();
         try
         {
-            return RunCapture("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 4000)
+            var result = RunCapture("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 4000)
                 .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Select(line => line.Split('|', 2))
                 .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
@@ -116,9 +127,25 @@ internal static class NvidiaSmi
                 .GroupBy(x => x.Pid!.Value)
                 .Select(group => new GpuProcess(ProcessName(group.Key), group.Sum(x => x.Memory), group.Key))
                 .OrderByDescending(x => x.MemoryMiB).ToList();
+            // A call that only returns near the kill timeout was effectively
+            // hung: back off exponentially (15s, 30s, 60s ... capped at 5min).
+            // Fast calls - even empty ones - reset the backoff immediately.
+            counterBackoff = sw.Elapsed >= TimeSpan.FromMilliseconds(3500)
+                ? NextCounterBackoff()
+                : TimeSpan.Zero;
+            return result;
         }
-        catch { return []; }
+        catch
+        {
+            counterBackoff = NextCounterBackoff();
+            return [];
+        }
     }
+
+    private static TimeSpan NextCounterBackoff() =>
+        counterBackoff == TimeSpan.Zero ? TimeSpan.FromSeconds(15)
+        : counterBackoff < TimeSpan.FromMinutes(5) ? counterBackoff * 2
+        : counterBackoff;
 
     // Reads the dedicated VRAM size of the NVIDIA display adapters from the
     // registry (HardwareInformation.qwMemorySize). Returns MiB, or 0 when the

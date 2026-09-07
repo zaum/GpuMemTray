@@ -7,22 +7,27 @@ namespace GpuMemTray;
 
 internal static class Program
 {
+    // Held for the whole process lifetime: a second launch detects the held
+    // mutex and quits, so two tray icons can never poll the driver at once.
+    private static Mutex? singleInstance;
     [STAThread]
     static void Main()
     {
+        singleInstance = new Mutex(true, "GpuMemTray_SingleInstance", out var first);
+        if (!first) return;
         ApplicationConfiguration.Initialize();
         Application.Run(new TrayApplication());
     }
 }
 
-internal sealed class TrayApplication : ApplicationContext
+internal sealed class TrayApplication : ApplicationContext, IMessageFilter
 {
-    private const string AppName = "GpuMemTray";
     private readonly NotifyIcon trayIcon;
     private readonly PopupWindow popup;
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = 1500 };
     private readonly System.Windows.Forms.Timer hoverTimer = new() { Interval = 100 };
     private readonly AppSettings settings = AppSettings.Load();
+    private readonly uint taskbarCreatedMsg = NativeMethods.RegisterWindowMessage("TaskbarCreated");
     private bool querying;
     private bool refreshPending;
     private bool exiting;
@@ -31,7 +36,11 @@ internal sealed class TrayApplication : ApplicationContext
     private bool lastShowPercent;
     private Rectangle lastIconBounds;
     private Point lastShellHover;
-    private long lastShellHoverStamp = long.MinValue;
+    // Starts at 0 (long expired), not long.MinValue: tick - long.MinValue
+    // overflows C# long arithmetic to a negative number, which would make
+    // HasRecentShellHover permanently true - including a phantom hover zone
+    // around (0,0) that could pop the window open in the screen corner.
+    private long lastShellHoverStamp;
     private const int ShellHoverGraceMs = 1500;
     private GpuSnapshot snapshot = GpuSnapshot.Empty;
 
@@ -64,16 +73,33 @@ internal sealed class TrayApplication : ApplicationContext
         // Windows signals this before tearing down the session (shutdown,
         // logoff, restart). Polling must stop immediately: a child process
         // spawned now fails to initialize and shows an error dialog.
-        SystemEvents.SessionEnding += (_, _) =>
-        {
-            NvidiaSmi.SessionEnding = true;
-            exiting = true;
-            refreshTimer.Stop();
-            hoverTimer.Stop();
-        };
+        SystemEvents.SessionEnding += OnSessionEnding;
         refreshTimer.Start();
         hoverTimer.Start();
+        Application.AddMessageFilter(this);
         _ = RefreshAsync();
+    }
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        // Explorer restarted (crash or manual restart): every tray icon is
+        // gone and the shell broadcasts TaskbarCreated. Re-register ours,
+        // otherwise the app would keep running invisibly.
+        if (!exiting && taskbarCreatedMsg != 0 && m.Msg == (int)taskbarCreatedMsg)
+        {
+            lastIconBounds = default;
+            trayIcon.Visible = false;
+            trayIcon.Visible = true;
+        }
+        return false;
+    }
+
+    private void OnSessionEnding(object sender, SessionEndingEventArgs e)
+    {
+        NvidiaSmi.SessionEnding = true;
+        exiting = true;
+        refreshTimer.Stop();
+        hoverTimer.Stop();
     }
 
     private ContextMenuStrip BuildMenu()
@@ -136,9 +162,12 @@ internal sealed class TrayApplication : ApplicationContext
     private void ShowPopup()
     {
         if (exiting) return;
-        popup.SetSnapshot(snapshot);
         if (!popup.Visible)
         {
+            // The timer already refreshes the visible popup every 1.5s, so
+            // only rebuild here when it is about to be shown (this also runs
+            // on every mouse-move over the icon while hovering).
+            popup.SetSnapshot(snapshot);
             NativeMethods.GetCursorPos(out var cursor);
             TryGetIconBounds(out var iconBounds, 0);
             popup.ShowNear(cursor, iconBounds);
@@ -242,6 +271,10 @@ internal sealed class TrayApplication : ApplicationContext
         exiting = true;
         refreshTimer.Stop();
         hoverTimer.Stop();
+        SystemEvents.SessionEnding -= OnSessionEnding;
+        Application.RemoveMessageFilter(this);
+        refreshTimer.Dispose();
+        hoverTimer.Dispose();
         popup.Dispose();
         trayIcon.Visible = false;
         trayIcon.Icon?.Dispose();
@@ -285,6 +318,10 @@ internal sealed class PopupWindow : Form
     private readonly Label empty = new() { AutoSize = false, ForeColor = Color.FromArgb(167, 177, 191), Font = new Font("Segoe UI", 9f), TextAlign = ContentAlignment.MiddleCenter };
     public event Action? ProcessKilled;
     private int arrowX;
+    // False: arrow at the bottom pointing down (bottom taskbar). True: arrow
+    // at the top pointing up (top taskbar or popup below the cursor).
+    private bool arrowUp;
+    private GpuSnapshot current = GpuSnapshot.Empty;
 
     public PopupWindow()
     {
@@ -304,6 +341,17 @@ internal sealed class PopupWindow : Form
         Padding = DpiScaling.Scale(new Padding(16, 14, 16, 14));
 
         Controls.AddRange([title, usage, barBackground, processes, empty]);
+        barBackground.Controls.Add(barFill);
+        ApplyLayout();
+        processes.Size = new Size(388, 0);
+    }
+
+    // All inner geometry in one place so a runtime DPI change can rebuild it:
+    // positions baked in the constructor would otherwise mix the old factor
+    // with the new one (overlapping or gapped rows on high-DPI monitors).
+    private void ApplyLayout()
+    {
+        Padding = DpiScaling.Scale(new Padding(16, 14, 16, 14));
 
         title.Location = new Point(16, HeaderTop);
         title.Size = new Size(180, TitleRowHeight);
@@ -314,15 +362,24 @@ internal sealed class PopupWindow : Form
         var barTop = HeaderTop + TitleRowHeight + GapTitleToBar;
         barBackground.Location = new Point(16, barTop);
         barBackground.Size = new Size(388, BarHeight);
-        barBackground.Controls.Add(barFill);
 
         var contentTop = barTop + BarHeight + GapBarToContent;
         processes.Location = new Point(16, contentTop);
-        processes.Size = new Size(388, 0);
 
         empty.Location = new Point(16, contentTop);
         empty.Size = new Size(388, DpiScaling.Scale(60));
+    }
 
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        ApplyLayout();
+        // Rows were built with the old factor; drop them so SetSnapshot
+        // recreates them with the new row height.
+        foreach (Control row in processes.Controls) row.Dispose();
+        processes.Controls.Clear();
+        SetSnapshot(current);
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -336,22 +393,41 @@ internal sealed class PopupWindow : Form
 
     private void UpdateRegion()
     {
-        var path = new GraphicsPath();
+        // The previous Region is a scarce GDI object: dispose it before
+        // replacing, otherwise every show/resize leaks one in this
+        // long-running tray app.
+        var oldRegion = Region;
+        Region = null;
+        oldRegion?.Dispose();
+        using var path = new GraphicsPath();
         var radius = DpiScaling.Scale(8);
         var bodyHeight = Height - ArrowHeightScaled;
-        path.AddArc(0, 0, radius * 2, radius * 2, 180, 90);
-        path.AddArc(Width - radius * 2, 0, radius * 2, radius * 2, 270, 90);
-        path.AddArc(Width - radius * 2, bodyHeight - radius * 2, radius * 2, radius * 2, 0, 90);
-        path.AddArc(0, bodyHeight - radius * 2, radius * 2, radius * 2, 90, 90);
+        var bodyTop = arrowUp ? ArrowHeightScaled : 0;
+        path.AddArc(0, bodyTop, radius * 2, radius * 2, 180, 90);
+        path.AddArc(Width - radius * 2, bodyTop, radius * 2, radius * 2, 270, 90);
+        path.AddArc(Width - radius * 2, bodyTop + bodyHeight - radius * 2, radius * 2, radius * 2, 0, 90);
+        path.AddArc(0, bodyTop + bodyHeight - radius * 2, radius * 2, radius * 2, 90, 90);
         path.CloseFigure();
         var arrowLeft = arrowX - ArrowWidthScaled / 2;
-        var arrowTop = bodyHeight;
-        path.AddPolygon(new[]
+        if (arrowUp)
         {
-            new Point(arrowLeft, arrowTop),
-            new Point(arrowLeft + ArrowWidthScaled, arrowTop),
-            new Point(arrowX, arrowTop + ArrowHeightScaled)
-        });
+            path.AddPolygon(new[]
+            {
+                new Point(arrowLeft, bodyTop),
+                new Point(arrowLeft + ArrowWidthScaled, bodyTop),
+                new Point(arrowX, 0)
+            });
+        }
+        else
+        {
+            var arrowTop = bodyTop + bodyHeight;
+            path.AddPolygon(new[]
+            {
+                new Point(arrowLeft, arrowTop),
+                new Point(arrowLeft + ArrowWidthScaled, arrowTop),
+                new Point(arrowX, arrowTop + ArrowHeightScaled)
+            });
+        }
         path.CloseFigure();
         Region = new Region(path);
     }
@@ -404,22 +480,26 @@ internal sealed class PopupWindow : Form
         {
             // Bottom-docked taskbar (pinned or auto-hidden): park the popup
             // (arrow tip) a few pixels above the taskbar's top edge.
+            arrowUp = false;
             y = Math.Max(taskbar.Top - edge - Height, screen.Top + edge);
         }
         else if (hasTaskbar && taskbarEdge == NativeMethods.AbeTop && cursor.Y <= taskbar.Bottom + hoverTolerance)
         {
             // Top-docked taskbar: place the popup just below the taskbar's
-            // bottom edge.
+            // bottom edge, arrow pointing up at it.
+            arrowUp = true;
             y = Math.Min(taskbar.Bottom + edge, screen.Bottom - Height - edge);
         }
         else if (cursor.Y >= screen.Bottom)
         {
             // Bottom taskbar on another monitor whose rect the shell did not
             // report: the working area still marks the taskbar's top edge.
+            arrowUp = false;
             y = screen.Bottom - edge - Height;
         }
         else if (cursor.Y < screen.Top)
         {
+            arrowUp = true;
             y = screen.Top + edge;
         }
         else
@@ -430,9 +510,16 @@ internal sealed class PopupWindow : Form
             // the upper half. The cursor is stable while hovering, the
             // shell rect is not.
             var gap = ArrowGapScaled;
-            y = cursor.Y >= screen.Top + screen.Height / 2
-                ? cursor.Y - Height - gap
-                : cursor.Y + gap;
+            if (cursor.Y >= screen.Top + screen.Height / 2)
+            {
+                arrowUp = false;
+                y = cursor.Y - Height - gap;
+            }
+            else
+            {
+                arrowUp = true;
+                y = cursor.Y + gap;
+            }
             y = Math.Clamp(y, screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge));
         }
         // Under PerMonitorV2 the first Show() would create the window handle
@@ -450,6 +537,7 @@ internal sealed class PopupWindow : Form
     public void SetSnapshot(GpuSnapshot data)
     {
         if (IsHandleCreated) DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        current = data;
         // The refresh timer calls this every 1.5s even while the popup is
         // visible. A changed process count changes Height - without
         // re-anchoring, the arrow tip would drift by exactly one row height
@@ -564,10 +652,12 @@ internal sealed class PopupWindow : Form
         processes.ResumeLayout(true);
         ResumeLayout(true);
 
-        if (wasVisible && IsHandleCreated && Height != oldHeight)
+        if (wasVisible && IsHandleCreated && Height != oldHeight && !arrowUp)
         {
-            // Keep the arrow tip pinned: shift the top by the height delta so
-            // the bottom edge stays where ShowNear put it.
+            // Arrow at the bottom: keep the arrow tip pinned by shifting the
+            // top by the height delta so the bottom edge stays where ShowNear
+            // put it. (With the arrow at the top, the top edge is already the
+            // anchor, so growing downward needs no move.)
             var screen = Screen.FromControl(this).WorkingArea;
             var edge = DpiScaling.Scale(6);
             var newY = oldLocation.Y + (oldHeight - Height);
@@ -582,15 +672,17 @@ internal sealed class PopupWindow : Form
 
 internal sealed class ProcessRow : DoubleBufferedPanel
 {
-    private string name;
-    private string memory;
+    private string name = string.Empty;
+    private string memory = string.Empty;
     private int? pid;
     private bool hoverKill;
     private readonly Font nameFont = new Font("Segoe UI", 9f);
     private readonly Font memoryFont = new Font("Segoe UI Semibold", 9f);
     private readonly Font killFont = new Font("Segoe UI", 10f);
     private static readonly StringFormat CenterFormat = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-    private Rectangle KillBounds => new(Width - 32, 0, 32, Height);
+    private static readonly StringFormat NameFormat = new() { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
+    private static readonly StringFormat MemoryFormat = new() { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
+    private Rectangle KillBounds => new(Width - DpiScaling.Scale(32), 0, DpiScaling.Scale(32), Height);
     public event Action? ProcessKilled;
 
     public ProcessRow(GpuProcess process)
@@ -607,10 +699,11 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     private void OnPaint(object? sender, PaintEventArgs e)
     {
         e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        var killLeft = Width - DpiScaling.Scale(32);
         using var nameBrush = new SolidBrush(Color.FromArgb(232, 236, 242));
-        e.Graphics.DrawString(name, nameFont, nameBrush, new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter });
+        e.Graphics.DrawString(name, nameFont, nameBrush, new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), NameFormat);
         using var memoryBrush = new SolidBrush(Color.FromArgb(150, 202, 255));
-        e.Graphics.DrawString(memory, memoryFont, memoryBrush, new RectangleF(254, DpiScaling.Scale(4), 94, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });
+        e.Graphics.DrawString(memory, memoryFont, memoryBrush, new RectangleF(254, DpiScaling.Scale(4), Math.Max(10, killLeft - 6 - 254), DpiScaling.Scale(18)), MemoryFormat);
 
         if (pid is null) return;
 
