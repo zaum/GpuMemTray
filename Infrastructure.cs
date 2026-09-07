@@ -39,13 +39,17 @@ internal static class StartupManager
     }
     public static void SetEnabled(bool enabled)
     {
-        using var key = Registry.CurrentUser.CreateSubKey(KeyPath);
-        if (enabled)
+        try
         {
-            var path = Environment.ProcessPath ?? Application.ExecutablePath;
-            key.SetValue("GpuMemTray", $"\"{path}\"");
+            using var key = Registry.CurrentUser.CreateSubKey(KeyPath);
+            if (enabled)
+            {
+                var path = Environment.ProcessPath ?? Application.ExecutablePath;
+                key.SetValue("GpuMemTray", $"\"{path}\"");
+            }
+            else key.DeleteValue("GpuMemTray", false);
         }
-        else key.DeleteValue("GpuMemTray", false);
+        catch { /* Toggling startup is best-effort and must never crash the app. */ }
     }
 }
 

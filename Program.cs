@@ -27,6 +27,8 @@ internal sealed class TrayApplication : ApplicationContext
     private bool refreshPending;
     private bool exiting;
     private int outsideTicks;
+    private int lastIconPercent = -1;
+    private bool lastShowPercent;
     private Rectangle lastIconBounds;
     private Point lastShellHover;
     private long lastShellHoverStamp = long.MinValue;
@@ -111,8 +113,14 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void UpdateTrayIcon()
     {
+        var percent = snapshot.Percent;
+        // Rebuilding the icon is relatively expensive (HICON creation), so only
+        // recreate it when the displayed value actually changed.
+        if (percent == lastIconPercent && settings.ShowPercentage == lastShowPercent) return;
+        lastIconPercent = percent;
+        lastShowPercent = settings.ShowPercentage;
         trayIcon.Icon?.Dispose();
-        trayIcon.Icon = TrayIconFactory.Create(snapshot.Percent, settings.ShowPercentage);
+        trayIcon.Icon = TrayIconFactory.Create(percent, settings.ShowPercentage);
     }
 
     private void ShowPopup()
@@ -188,12 +196,17 @@ internal sealed class TrayApplication : ApplicationContext
 
     private bool TryGetIconBounds(out Rectangle bounds, int inflate)
     {
-        if (TrayIconBounds.TryGetScreenBounds(trayIcon, out var current))
+        // The shell can report a stale rectangle on the very first hover after
+        // startup (or right after a taskbar re-layout). Since the cursor is what
+        // actually hovers the icon whenever this is queried, reject any rectangle
+        // that is not near the cursor - otherwise the popup would open far away
+        // from the tray icon.
+        if (TrayIconBounds.TryGetScreenBounds(trayIcon, out var current) && IsNearCursor(current))
         {
             lastIconBounds = current;
             bounds = current;
         }
-        else if (lastIconBounds.Width > 0)
+        else if (lastIconBounds.Width > 0 && IsNearCursor(lastIconBounds))
         {
             bounds = lastIconBounds;
         }
@@ -206,12 +219,20 @@ internal sealed class TrayApplication : ApplicationContext
         return true;
     }
 
+    private static bool IsNearCursor(Rectangle bounds)
+    {
+        NativeMethods.GetCursorPos(out var p);
+        var zone = bounds;
+        zone.Inflate(DpiScaling.Scale(48), DpiScaling.Scale(48));
+        return zone.Contains(new Point(p.X, p.Y));
+    }
+
     private void Exit()
     {
         exiting = true;
         refreshTimer.Stop();
         hoverTimer.Stop();
-        popup.Close();
+        popup.Dispose();
         trayIcon.Visible = false;
         trayIcon.Icon?.Dispose();
         trayIcon.Dispose();
@@ -329,10 +350,21 @@ internal sealed class PopupWindow : Form
         // (which is over the tray icon when the popup appears).
         var x = Math.Clamp(cursor.X - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
         arrowX = Width / 2;
-        var y = iconBounds.Height > 0
-            ? iconBounds.Top - Height - ArrowGapScaled
-            : screen.Bottom - Height - ArrowGapScaled;
-        if (y < screen.Top + DpiScaling.Scale(6)) y = screen.Top + DpiScaling.Scale(6);
+
+        // The cursor sits directly over the tray icon while the popup opens, so it
+        // is a reliable anchor even when the shell does not report a usable icon
+        // rectangle (the very first hover after startup is a common case).
+        var anchorTop = iconBounds.Height > 0 ? iconBounds.Top : cursor.Y;
+        var y = anchorTop - Height - ArrowGapScaled;
+        if (y < screen.Top + DpiScaling.Scale(6))
+        {
+            // Not enough room above the anchor (e.g. the taskbar pins to the top of
+            // the screen): flip the popup below the anchor instead of clamping to
+            // the top edge, which would land it far away from the icon.
+            var anchorBottom = iconBounds.Height > 0 ? iconBounds.Bottom : cursor.Y;
+            y = anchorBottom + ArrowGapScaled;
+            y = Math.Min(y, screen.Bottom - Height - DpiScaling.Scale(6));
+        }
         Location = new Point(x, y);
         UpdateRegion();
         Show();
