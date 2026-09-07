@@ -214,6 +214,17 @@ internal static class NativeMethods
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct APPBARDATA
+    {
+        public int cbSize;
+        public IntPtr hWnd;
+        public uint uCallbackMessage;
+        public uint uEdge;
+        public RECT rc;
+        public int lParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct NOTIFYICONIDENTIFIER
     {
         public IntPtr hWnd;
@@ -226,4 +237,41 @@ internal static class NativeMethods
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
     [DllImport("shell32.dll", SetLastError = true)]
     public static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER identifier, out RECT iconLocation);
+    [DllImport("shell32.dll")]
+    public static extern IntPtr SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
+
+    public const uint AbeTop = 1;
+    public const uint AbeBottom = 3;
+}
+
+internal static class TaskbarInfo
+{
+    // NOTE: ABM_GETTASKBARPOS is 5, not 4. Message 4 is ABM_GETSTATE (it only
+    // returns state flags such as auto-hide and never fills the rect/edge, so
+    // using 4 here always produced an empty rectangle and the caller silently
+    // fell back to the jittery icon-rect anchor).
+    private const uint AbmGetTaskbarPos = 0x00000005;
+
+    /// <summary>
+    /// Queries the shell for the taskbar's real rectangle. The rect is in the
+    /// same physical pixels as GetCursorPos/Screen.Bounds in a PerMonitorV2
+    /// process, so no DPI conversion is needed before comparing it with the
+    /// cursor or the WinForms working area. Unlike the working area, this stays
+    /// correct for an auto-hidden taskbar (an auto-hidden taskbar overlays the
+    /// screen without shrinking the working area, so the working area alone
+    /// cannot reveal where the taskbar sits) and for a resized (custom height)
+    /// taskbar, because the reported height is the real one. The shell reports
+    /// the revealed rectangle even while an auto-hide taskbar is hidden, which
+    /// keeps the popup anchor stable instead of jumping with the slide
+    /// animation. Only a top- or bottom-docked taskbar is reported; side-docked
+    /// ones return false.
+    /// </summary>
+    public static bool TryGetRect(out Rectangle bounds, out uint edge)
+    {
+        var data = new NativeMethods.APPBARDATA { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.APPBARDATA>() };
+        NativeMethods.SHAppBarMessage(AbmGetTaskbarPos, ref data);
+        edge = data.uEdge;
+        bounds = Rectangle.FromLTRB(data.rc.Left, data.rc.Top, data.rc.Right, data.rc.Bottom);
+        return bounds.Width > 0 && bounds.Height > 0 && (edge == NativeMethods.AbeTop || edge == NativeMethods.AbeBottom);
+    }
 }

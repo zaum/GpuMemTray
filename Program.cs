@@ -358,25 +358,72 @@ internal sealed class PopupWindow : Form
 
     public void ShowNear(NativeMethods.POINT cursor, Rectangle iconBounds)
     {
-        var screen = Screen.FromPoint(new Point(cursor.X, cursor.Y)).WorkingArea;
-        // The arrow is always centered in the popup. The popup is centered on the cursor
-        // (which is over the tray icon when the popup appears).
-        var x = Math.Clamp(cursor.X - Width / 2, screen.Left + DpiScaling.Scale(6), screen.Right - Width - DpiScaling.Scale(6));
-        arrowX = Width / 2;
+        // The vertical fallback no longer uses the shell icon rect (it jitters
+        // on Windows 11); the parameter stays only so existing callers compile.
+        _ = iconBounds;
+        // DeviceDpi follows the monitor the window is on, so refresh the
+        // shared scale factor on every show: a stale factor (cached once in
+        // the constructor) would mix scaled and unscaled pixels on a high-DPI
+        // monitor and shift the popup by exactly the reported 20-30px.
+        if (IsHandleCreated) DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        var cursorPoint = new Point(cursor.X, cursor.Y);
+        var monitor = Screen.FromPoint(cursorPoint);
+        var screen = monitor.WorkingArea;
+        var edge = DpiScaling.Scale(6);
+        // The arrow used to stay centered even when the popup was clamped to
+        // the screen edge, so near the screen sides it pointed at nothing.
+        // Keep it pointing at the cursor (the tray icon) instead.
+        var x = Math.Clamp(cursor.X - Width / 2, screen.Left + edge, Math.Max(screen.Left + edge, screen.Right - Width - edge));
+        var minArrow = DpiScaling.Scale(16) + ArrowWidthScaled / 2;
+        arrowX = Math.Clamp(cursor.X - x, minArrow, Math.Max(minArrow, Width - minArrow));
 
-        // The cursor sits directly over the tray icon while the popup opens, so it
-        // is a reliable anchor even when the shell does not report a usable icon
-        // rectangle (the very first hover after startup is a common case).
-        var anchorTop = iconBounds.Height > 0 ? iconBounds.Top : cursor.Y;
-        var y = anchorTop - Height - ArrowGapScaled;
-        if (y < screen.Top + DpiScaling.Scale(6))
+        // Vertical anchoring must be deterministic. The shell-reported icon
+        // rectangle jitters by roughly 15-30px on Windows 11 (sometimes the
+        // full taskbar-button height, sometimes a stale rect), and the cursor
+        // rests somewhere over the icon, typically well below its top edge -
+        // so neither is a stable anchor. The taskbar's own rectangle (from
+        // SHAppBarMessage, which reports the revealed rect even for an
+        // auto-hidden or resized/custom-height taskbar, in the same physical
+        // pixels as the cursor) is stable for every show, so the arrow tip
+        // always lands just above/below the taskbar.
+        int y;
+        var hoverTolerance = DpiScaling.Scale(24);
+        var hasTaskbar = TaskbarInfo.TryGetRect(out var taskbar, out var taskbarEdge)
+            && monitor.Bounds.IntersectsWith(taskbar);
+        if (hasTaskbar && taskbarEdge == NativeMethods.AbeBottom && cursor.Y >= taskbar.Top - hoverTolerance)
         {
-            // Not enough room above the anchor (e.g. the taskbar pins to the top of
-            // the screen): flip the popup below the anchor instead of clamping to
-            // the top edge, which would land it far away from the icon.
-            var anchorBottom = iconBounds.Height > 0 ? iconBounds.Bottom : cursor.Y;
-            y = anchorBottom + ArrowGapScaled;
-            y = Math.Min(y, screen.Bottom - Height - DpiScaling.Scale(6));
+            // Bottom-docked taskbar (pinned or auto-hidden): park the popup
+            // (arrow tip) a few pixels above the taskbar's top edge.
+            y = Math.Max(taskbar.Top - edge - Height, screen.Top + edge);
+        }
+        else if (hasTaskbar && taskbarEdge == NativeMethods.AbeTop && cursor.Y <= taskbar.Bottom + hoverTolerance)
+        {
+            // Top-docked taskbar: place the popup just below the taskbar's
+            // bottom edge.
+            y = Math.Min(taskbar.Bottom + edge, screen.Bottom - Height - edge);
+        }
+        else if (cursor.Y >= screen.Bottom)
+        {
+            // Bottom taskbar on another monitor whose rect the shell did not
+            // report: the working area still marks the taskbar's top edge.
+            y = screen.Bottom - edge - Height;
+        }
+        else if (cursor.Y < screen.Top)
+        {
+            y = screen.Top + edge;
+        }
+        else
+        {
+            // Unusual shell layout (e.g. a vertical taskbar): anchor to the
+            // cursor rather than the jittery shell icon rect - above it in the
+            // lower half so the popup never covers the tray icon, below it in
+            // the upper half. The cursor is stable while hovering, the
+            // shell rect is not.
+            var gap = ArrowGapScaled;
+            y = cursor.Y >= screen.Top + screen.Height / 2
+                ? cursor.Y - Height - gap
+                : cursor.Y + gap;
+            y = Math.Clamp(y, screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge));
         }
         // Under PerMonitorV2 the first Show() would create the window handle
         // and reinterpret the requested position through the DPI-adjustment
@@ -392,6 +439,14 @@ internal sealed class PopupWindow : Form
 
     public void SetSnapshot(GpuSnapshot data)
     {
+        if (IsHandleCreated) DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        // The refresh timer calls this every 1.5s even while the popup is
+        // visible. A changed process count changes Height - without
+        // re-anchoring, the arrow tip would drift by exactly one row height
+        // (20-30px scaled), which is the reported intermittent slip.
+        var oldHeight = Height;
+        var oldLocation = Location;
+        var wasVisible = Visible;
         SuspendLayout();
         processes.SuspendLayout();
 
@@ -433,8 +488,24 @@ internal sealed class PopupWindow : Form
             var totalProcessHeight = count * RowHeight;
 
             NativeMethods.GetCursorPos(out var cursor);
-            var screen = Screen.FromPoint(new Point(cursor.X, cursor.Y)).WorkingArea;
-            var maxContentHeight = screen.Height - HeaderHeight - DpiScaling.Scale(40) - ArrowHeightScaled;
+            var monitor = Screen.FromPoint(new Point(cursor.X, cursor.Y));
+            var screen = monitor.WorkingArea;
+            // Cap the list to the space actually available above/below the
+            // taskbar, not the full working area: with an auto-hidden or
+            // resized (custom height) taskbar the working area spans the whole
+            // monitor, so the full-height cap would let the popup overlap the
+            // revealed taskbar on a high-DPI display.
+            var availableHeight = screen.Height;
+            if (TaskbarInfo.TryGetRect(out var taskbarRect, out var taskbarEdge)
+                && monitor.Bounds.IntersectsWith(taskbarRect))
+            {
+                if (taskbarEdge == NativeMethods.AbeBottom)
+                    availableHeight = taskbarRect.Top - screen.Top;
+                else if (taskbarEdge == NativeMethods.AbeTop)
+                    availableHeight = screen.Bottom - taskbarRect.Bottom;
+            }
+            var maxContentHeight = Math.Max(RowHeight,
+                availableHeight - HeaderHeight - DpiScaling.Scale(40) - ArrowHeightScaled);
 
             if (totalProcessHeight > maxContentHeight)
             {
@@ -482,6 +553,17 @@ internal sealed class PopupWindow : Form
 
         processes.ResumeLayout(true);
         ResumeLayout(true);
+
+        if (wasVisible && IsHandleCreated && Height != oldHeight)
+        {
+            // Keep the arrow tip pinned: shift the top by the height delta so
+            // the bottom edge stays where ShowNear put it.
+            var screen = Screen.FromControl(this).WorkingArea;
+            var edge = DpiScaling.Scale(6);
+            var newY = oldLocation.Y + (oldHeight - Height);
+            Location = new Point(oldLocation.X,
+                Math.Clamp(newY, screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge)));
+        }
     }
 
     private static string FormatGiB(int mib) => mib >= 1024 ? $"{mib / 1024d:0.#} GB" : $"{mib} MB";
