@@ -186,17 +186,26 @@ internal static class TrayIconBounds
     {
         id = default;
         var type = typeof(NotifyIcon);
-        if (type.GetField("window", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon) is not NativeWindow window
-            || window.Handle == IntPtr.Zero)
+        // .NET renamed the backing fields ("window"/"id" on .NET Framework,
+        // "_window"/"_id" as UInt32 on modern .NET). Accept either spelling
+        // and either integer type - with the old names every lookup silently
+        // missed and the icon rect was never found, so the popup anchored to
+        // the cursor's entry edge instead of the icon center.
+        var window = type.GetField("_window", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon)
+            ?? type.GetField("window", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon);
+        if (window is not NativeWindow native || native.Handle == IntPtr.Zero)
             return false;
 
-        var rawId = type.GetField("id", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon);
-        if (rawId is not int numericId) return false;
+        var rawId = type.GetField("_id", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon)
+            ?? type.GetField("id", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(icon);
+        uint numericId = rawId switch { int i => (uint)i, uint u => u, _ => 0 };
+        if (numericId == 0) return false;
 
         id = new NativeMethods.NOTIFYICONIDENTIFIER
         {
-            hWnd = window.Handle,
-            uID = (uint)numericId,
+            cbSize = Marshal.SizeOf<NativeMethods.NOTIFYICONIDENTIFIER>(),
+            hWnd = native.Handle,
+            uID = numericId,
             guidItem = Guid.Empty
         };
         return true;
@@ -227,6 +236,9 @@ internal static class NativeMethods
     [StructLayout(LayoutKind.Sequential)]
     public struct NOTIFYICONIDENTIFIER
     {
+        // The native struct starts with its own size; without it
+        // Shell_NotifyIconGetRect refuses the call.
+        public int cbSize;
         public IntPtr hWnd;
         public uint uID;
         public Guid guidItem;

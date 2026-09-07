@@ -358,9 +358,6 @@ internal sealed class PopupWindow : Form
 
     public void ShowNear(NativeMethods.POINT cursor, Rectangle iconBounds)
     {
-        // The vertical fallback no longer uses the shell icon rect (it jitters
-        // on Windows 11); the parameter stays only so existing callers compile.
-        _ = iconBounds;
         // DeviceDpi follows the monitor the window is on, so refresh the
         // shared scale factor on every show: a stale factor (cached once in
         // the constructor) would mix scaled and unscaled pixels on a high-DPI
@@ -370,12 +367,25 @@ internal sealed class PopupWindow : Form
         var monitor = Screen.FromPoint(cursorPoint);
         var screen = monitor.WorkingArea;
         var edge = DpiScaling.Scale(6);
-        // The arrow used to stay centered even when the popup was clamped to
-        // the screen edge, so near the screen sides it pointed at nothing.
-        // Keep it pointing at the cursor (the tray icon) instead.
-        var x = Math.Clamp(cursor.X - Width / 2, screen.Left + edge, Math.Max(screen.Left + edge, screen.Right - Width - edge));
+        // Horizontal anchor: center on the tray icon itself, not on the
+        // cursor. The cursor can sit anywhere over the ~24-40px wide icon, so
+        // centering on the cursor shifted the popup (and its arrow) left or
+        // right by that amount on every show. The shell icon rect's X center
+        // is stable (its top edge is the jittery part on Windows 11, which is
+        // why the vertical anchor uses the taskbar rect instead); fall back
+        // to the cursor only when no usable rect was reported.
+        var anchorX = cursor.X;
+        if (iconBounds.Width > 0)
+        {
+            var iconCenterX = iconBounds.Left + iconBounds.Width / 2;
+            if (Math.Abs(iconCenterX - cursor.X) <= DpiScaling.Scale(64))
+                anchorX = iconCenterX;
+        }
+        var x = Math.Clamp(anchorX - Width / 2, screen.Left + edge, Math.Max(screen.Left + edge, screen.Right - Width - edge));
+        // Keep the arrow pointing at the icon when the popup is clamped to a
+        // screen edge instead of staying centered and pointing at nothing.
         var minArrow = DpiScaling.Scale(16) + ArrowWidthScaled / 2;
-        arrowX = Math.Clamp(cursor.X - x, minArrow, Math.Max(minArrow, Width - minArrow));
+        arrowX = Math.Clamp(anchorX - x, minArrow, Math.Max(minArrow, Width - minArrow));
 
         // Vertical anchoring must be deterministic. The shell-reported icon
         // rectangle jitters by roughly 15-30px on Windows 11 (sometimes the
