@@ -20,8 +20,12 @@ internal sealed class AppSettings
     }
     public void Save()
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(this));
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(this));
+        }
+        catch { /* Saving settings is best-effort and must never crash the app. */ }
     }
 }
 

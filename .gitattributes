@@ -1,0 +1,4 @@
+# Normalize line endings: LF is stored in the repository, CRLF is used
+# in the Windows working tree.
+* text=auto
+*.cs text eol=crlf

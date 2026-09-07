@@ -347,7 +347,13 @@ internal sealed class PopupWindow : Form
         var titleText = data.Available ? "GPU MEMORY" : "GPU MEMORY — UNAVAILABLE";
         if (title.Text != titleText) title.Text = titleText;
 
-        var usageText = data.Available ? $"{FormatGiB(data.UsedMiB)} / {FormatGiB(data.TotalMiB)}" : "nvidia-smi unavailable";
+        // When the total VRAM is unknown (TotalMiB == 0), show only the used
+        // amount instead of a misleading "X / 0 MB".
+        var usageText = data.Available
+            ? data.TotalMiB > 0
+                ? $"{FormatGiB(data.UsedMiB)} / {FormatGiB(data.TotalMiB)}"
+                : $"{FormatGiB(data.UsedMiB)} used"
+            : "nvidia-smi unavailable";
         if (usage.Text != usageText) usage.Text = usageText;
 
         var newBarWidth = (int)Math.Round(barBackground.Width * data.Percent / 100.0);
@@ -458,8 +464,10 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     private void OnPaint(object? sender, PaintEventArgs e)
     {
         e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        e.Graphics.DrawString(name, nameFont, new SolidBrush(Color.FromArgb(232, 236, 242)), new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter });
-        e.Graphics.DrawString(memory, memoryFont, new SolidBrush(Color.FromArgb(150, 202, 255)), new RectangleF(254, DpiScaling.Scale(4), 94, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });
+        using var nameBrush = new SolidBrush(Color.FromArgb(232, 236, 242));
+        e.Graphics.DrawString(name, nameFont, nameBrush, new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter });
+        using var memoryBrush = new SolidBrush(Color.FromArgb(150, 202, 255));
+        e.Graphics.DrawString(memory, memoryFont, memoryBrush, new RectangleF(254, DpiScaling.Scale(4), 94, DpiScaling.Scale(18)), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });
 
         if (pid is null) return;
 
@@ -509,6 +517,17 @@ internal sealed class ProcessRow : DoubleBufferedPanel
             process.Kill();
         }
         catch { /* Process already exited or access is denied. */ }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            nameFont.Dispose();
+            memoryFont.Dispose();
+            killFont.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     public void UpdateData(GpuProcess process)
