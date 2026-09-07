@@ -280,6 +280,9 @@ internal sealed class PopupWindow : Form
     {
         DpiScaling.ScaleFactor = DeviceDpi / 96f;
         AutoScaleMode = AutoScaleMode.None;
+        // The popup is always placed manually next to the tray icon; never let
+        // Windows apply its default placement on the first Show().
+        StartPosition = FormStartPosition.Manual;
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         DoubleBuffered = true;
         Width = FixedWidth;
@@ -365,6 +368,12 @@ internal sealed class PopupWindow : Form
             y = anchorBottom + ArrowGapScaled;
             y = Math.Min(y, screen.Bottom - Height - DpiScaling.Scale(6));
         }
+        // Under PerMonitorV2 the first Show() would create the window handle
+        // and reinterpret the requested position through the DPI-adjustment
+        // path, offsetting the popup on scaled displays (e.g. 200%). Creating
+        // the handle up front makes every Location assignment a direct,
+        // unscaled window move, so the very first appearance lands correctly.
+        if (!IsHandleCreated) _ = Handle;
         Location = new Point(x, y);
         UpdateRegion();
         Show();
