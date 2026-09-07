@@ -61,6 +61,16 @@ internal sealed class TrayApplication : ApplicationContext
         trayIcon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowPopup(); };
         refreshTimer.Tick += async (_, _) => await RefreshAsync();
         hoverTimer.Tick += (_, _) => UpdatePopupHoverState();
+        // Windows signals this before tearing down the session (shutdown,
+        // logoff, restart). Polling must stop immediately: a child process
+        // spawned now fails to initialize and shows an error dialog.
+        SystemEvents.SessionEnding += (_, _) =>
+        {
+            NvidiaSmi.SessionEnding = true;
+            exiting = true;
+            refreshTimer.Stop();
+            hoverTimer.Stop();
+        };
         refreshTimer.Start();
         hoverTimer.Start();
         _ = RefreshAsync();

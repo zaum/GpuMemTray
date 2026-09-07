@@ -5,8 +5,15 @@ namespace GpuMemTray;
 
 internal static class NvidiaSmi
 {
+    // Set when the Windows session is ending (logoff or shutdown). Starting a
+    // new child process at that point fails DLL initialization (0xc0000142)
+    // and pops an error dialog that also stalls the shutdown, so every spawn
+    // site checks this flag first.
+    public static volatile bool SessionEnding;
+
     public static GpuSnapshot Read()
     {
+        if (SessionEnding) return GpuSnapshot.Empty;
         try
         {
             var memoryLines = Run("--query-gpu=memory.used,memory.total --format=csv,noheader,nounits");
@@ -65,6 +72,9 @@ internal static class NvidiaSmi
                 RedirectStandardError = true
             }
         };
+        // Never spawn children while the session is tearing down: the child
+        // cannot initialize and Windows shows a 0xc0000142 error dialog.
+        if (SessionEnding) return string.Empty;
         if (!process.Start()) return string.Empty;
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
