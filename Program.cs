@@ -306,6 +306,7 @@ internal sealed class PopupWindow : Form
     private const int ArrowWidth = 20;
     private const int ArrowHeight = 10;
     private const int ArrowGap = 40;
+    private const int BottomTaskbarGap = 0;
     private static int ArrowWidthScaled => DpiScaling.Scale(ArrowWidth);
     private static int ArrowHeightScaled => DpiScaling.Scale(ArrowHeight);
     private static int ArrowGapScaled => DpiScaling.Scale(ArrowGap);
@@ -479,9 +480,9 @@ internal sealed class PopupWindow : Form
         if (hasTaskbar && taskbarEdge == NativeMethods.AbeBottom && cursor.Y >= taskbar.Top - hoverTolerance)
         {
             // Bottom-docked taskbar (pinned or auto-hidden): park the popup
-            // (arrow tip) a few pixels above the taskbar's top edge.
+            // (arrow tip) just above the taskbar's top edge.
             arrowUp = false;
-            y = Math.Max(taskbar.Top - edge - Height, screen.Top + edge);
+            y = Math.Max(taskbar.Top - DpiScaling.Scale(BottomTaskbarGap) - Height, screen.Top + edge);
         }
         else if (hasTaskbar && taskbarEdge == NativeMethods.AbeTop && cursor.Y <= taskbar.Bottom + hoverTolerance)
         {
