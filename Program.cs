@@ -295,7 +295,12 @@ internal class DoubleBufferedPanel : Panel
 
 internal sealed class PopupWindow : Form
 {
-    private const int FixedWidth = 420;
+    // The popup is as wide as its content needs, clamped to this range so it
+    // never collapses to a sliver or grows into a banner. Both are logical
+    // (96 dpi) measures and get scaled like every other literal here.
+    private const int MinWidth = 260;
+    private const int MaxWidth = 560;
+    private const int ContentGap = 16;
     private static int RowHeight => DpiScaling.Scale(26);
     private static int HeaderTop => DpiScaling.Scale(12);
     private static int TitleRowHeight => DpiScaling.Scale(22);
@@ -311,12 +316,14 @@ internal sealed class PopupWindow : Form
     private static int ArrowHeightScaled => DpiScaling.Scale(ArrowHeight);
     private static int ArrowGapScaled => DpiScaling.Scale(ArrowGap);
 
-    private readonly Label title = new() { AutoSize = false, Font = new Font("Segoe UI Semibold", 10f), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft };
-    private readonly Label usage = new() { AutoSize = false, Font = new Font("Segoe UI", 9f), ForeColor = Color.FromArgb(210, 218, 230), TextAlign = ContentAlignment.MiddleRight };
+    private static readonly Font TitleFont = new("Segoe UI Semibold", 10f);
+    private static readonly Font ValueFont = new("Segoe UI", 9f);
+    private readonly Label title = new() { AutoSize = false, Font = TitleFont, ForeColor = Color.White, TextAlign = ContentAlignment.MiddleLeft };
+    private readonly Label usage = new() { AutoSize = false, Font = ValueFont, ForeColor = Color.FromArgb(210, 218, 230), TextAlign = ContentAlignment.MiddleRight };
     private readonly Panel barBackground = new() { BackColor = Color.FromArgb(53, 60, 72) };
     private readonly Panel barFill = new();
     private readonly DoubleBufferedPanel processes = new() { AutoScroll = false, BackColor = Color.Transparent };
-    private readonly Label empty = new() { AutoSize = false, ForeColor = Color.FromArgb(167, 177, 191), Font = new Font("Segoe UI", 9f), TextAlign = ContentAlignment.MiddleCenter };
+    private readonly Label empty = new() { AutoSize = false, ForeColor = Color.FromArgb(167, 177, 191), Font = ValueFont, TextAlign = ContentAlignment.MiddleCenter };
     public event Action? ProcessKilled;
     private int arrowX;
     // False: arrow at the bottom pointing down (bottom taskbar). True: arrow
@@ -324,27 +331,34 @@ internal sealed class PopupWindow : Form
     private bool arrowUp;
     private GpuSnapshot current = GpuSnapshot.Empty;
 
+    // Inner width between the paddings, in device pixels. Derived from Width
+    // instead of hardcoded so it follows the DPI scale factor automatically.
+    private int ContentWidth => Width - Padding.Horizontal;
+
     public PopupWindow()
     {
-        DpiScaling.ScaleFactor = DeviceDpi / 96f;
         AutoScaleMode = AutoScaleMode.None;
         // The popup is always placed manually next to the tray icon; never let
         // Windows apply its default placement on the first Show().
         StartPosition = FormStartPosition.Manual;
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         DoubleBuffered = true;
-        Width = FixedWidth;
-        Height = DpiScaling.Scale(120);
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
         BackColor = Color.FromArgb(28, 32, 39);
-        Padding = DpiScaling.Scale(new Padding(16, 14, 16, 14));
 
         Controls.AddRange([title, usage, barBackground, processes, empty]);
         barBackground.Controls.Add(barFill);
+        // Create the window handle before the first layout pass. DeviceDpi is
+        // only meaningful once the handle exists - before that it reports the
+        // primary monitor, which baked a permanently 100%-sized popup while
+        // the fonts were drawn at the real 200% scale.
+        _ = Handle;
+        DpiScaling.ScaleFactor = DeviceDpi / 96f;
         ApplyLayout();
-        processes.Size = new Size(388, 0);
+        Height = DpiScaling.Scale(120);
+        processes.Size = new Size(ContentWidth, 0);
     }
 
     // All inner geometry in one place so a runtime DPI change can rebuild it:
@@ -352,23 +366,107 @@ internal sealed class PopupWindow : Form
     // with the new one (overlapping or gapped rows on high-DPI monitors).
     private void ApplyLayout()
     {
+        using var surface = new MeasuringSurface(DpiScaling.ScaleFactor);
+        ApplyLayout(surface.Graphics);
+    }
+
+    private void ApplyLayout(Graphics measuring)
+    {
+        // Measure on an off-screen surface pinned to the current scale factor
+        // instead of the form's own Graphics: a hidden form still reports the
+        // primary monitor's DPI, which would size the popup for the wrong screen.
+        Width = MeasureWidth(measuring);
         Padding = DpiScaling.Scale(new Padding(16, 14, 16, 14));
 
-        title.Location = new Point(16, HeaderTop);
-        title.Size = new Size(180, TitleRowHeight);
+        var headerLeft = DpiScaling.Scale(16);
+        var headerGap = DpiScaling.Scale(ContentGap);
 
-        usage.Location = new Point(200, HeaderTop);
-        usage.Size = new Size(204, TitleRowHeight);
+        title.Location = new Point(headerLeft, HeaderTop);
+        // The title keeps only what it needs; usage takes the rest and stays
+        // right-aligned against the bar's right edge.
+        title.Size = new Size(Math.Max(DpiScaling.Scale(60), (int)Math.Ceiling(MeasureText(measuring, title.Text, TitleFont)) + headerGap), TitleRowHeight);
+        usage.Location = new Point(title.Right + headerGap, HeaderTop);
+        usage.Size = new Size(Math.Max(DpiScaling.Scale(60), Width - title.Right - headerGap - DpiScaling.Scale(16)), TitleRowHeight);
 
         var barTop = HeaderTop + TitleRowHeight + GapTitleToBar;
-        barBackground.Location = new Point(16, barTop);
-        barBackground.Size = new Size(388, BarHeight);
+        barBackground.Location = new Point(headerLeft, barTop);
+        barBackground.Size = new Size(ContentWidth, BarHeight);
 
         var contentTop = barTop + BarHeight + GapBarToContent;
-        processes.Location = new Point(16, contentTop);
+        processes.Location = new Point(headerLeft, contentTop);
 
-        empty.Location = new Point(16, contentTop);
-        empty.Size = new Size(388, DpiScaling.Scale(60));
+        empty.Location = new Point(headerLeft, contentTop);
+        empty.Size = new Size(ContentWidth, DpiScaling.Scale(60));
+    }
+
+    // Width that fits the widest thing inside the popup: the widest process row
+    // (name + value + kill button), the header (title + usage) or the "no data"
+    // message - whichever needs the most room. Returned in device pixels.
+    private int MeasureWidth(Graphics g)
+    {
+        var sidePadding = DpiScaling.Scale(16);
+        var inner = MeasureContentWidth(g);
+        var step = DpiScaling.Scale(8);
+        // Round up to a scale-aware step so a value ticking from 120 to 121 MB
+        // does not resize the popup on every 1.5s refresh.
+        var stepped = (int)Math.Ceiling(inner / (float)step) * step;
+        return Math.Clamp(sidePadding * 2 + stepped, DpiScaling.Scale(MinWidth), DpiScaling.Scale(MaxWidth));
+    }
+
+    private float MeasureContentWidth(Graphics g)
+    {
+        var gap = DpiScaling.Scale(ContentGap);
+        var value = MeasureText(g, title.Text, TitleFont) + gap + MeasureText(g, usage.Text, ValueFont);
+
+        if (current.Processes.Count == 0)
+        {
+            // No rows: the empty-state message is the widest single line.
+            value = Math.Max(value, MeasureText(g, FirstLine(empty.Text), ValueFont));
+        }
+        else
+        {
+            var kill = DpiScaling.Scale(32);
+            foreach (var process in current.Processes)
+            {
+                var row = MeasureText(g, process.Name, ProcessRow.NameFont)
+                        + gap
+                        + MeasureText(g, ProcessRow.FormatMemory(process.MemoryMiB), ProcessRow.MemoryFont)
+                        + gap
+                        + kill;
+                if (row > value) value = row;
+            }
+        }
+        return value;
+    }
+
+    private static string FirstLine(string text)
+    {
+        var breakIndex = text.IndexOf('\n');
+        return breakIndex < 0 ? text : text[..breakIndex];
+    }
+
+    private static float MeasureText(Graphics g, string text, Font font) =>
+        string.IsNullOrEmpty(text) ? 0f : g.MeasureString(text, font).Width;
+
+    // A 1x1 bitmap is never drawn; it exists only to carry a DPI for GDI+ text
+    // measurement, so the result does not depend on where the popup currently is.
+    private sealed class MeasuringSurface : IDisposable
+    {
+        private readonly Bitmap bitmap = new(1, 1);
+        public Graphics Graphics { get; }
+
+        public MeasuringSurface(float scaleFactor)
+        {
+            var dpi = 96f * scaleFactor;
+            bitmap.SetResolution(dpi, dpi);
+            Graphics = Graphics.FromImage(bitmap);
+        }
+
+        public void Dispose()
+        {
+            Graphics.Dispose();
+            bitmap.Dispose();
+        }
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -435,11 +533,23 @@ internal sealed class PopupWindow : Form
 
     public void ShowNear(NativeMethods.POINT cursor, Rectangle iconBounds)
     {
-        // DeviceDpi follows the monitor the window is on, so refresh the
-        // shared scale factor on every show: a stale factor (cached once in
-        // the constructor) would mix scaled and unscaled pixels on a high-DPI
-        // monitor and shift the popup by exactly the reported 20-30px.
-        if (IsHandleCreated) DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        // DeviceDpi follows the monitor the window is on, so refresh the shared
+        // scale factor on every show: a stale factor would mix scaled and
+        // unscaled pixels on a high-DPI monitor. The factor also drives the
+        // static geometry, so when it actually changes the whole popup has to
+        // be rebuilt - otherwise the rows keep the old column widths and their
+        // values are clipped (the memory column lost its " GB"/" MB" suffix).
+        var previousFactor = DpiScaling.ScaleFactor;
+        DpiScaling.ScaleFactor = DeviceDpi / 96f;
+        if (previousFactor != DpiScaling.ScaleFactor)
+        {
+            ApplyLayout();
+            // Rows were built with the old factor; drop them so SetSnapshot
+            // recreates them with the new row height and width.
+            foreach (Control row in processes.Controls) row.Dispose();
+            processes.Controls.Clear();
+            SetSnapshot(current);
+        }
         var cursorPoint = new Point(cursor.X, cursor.Y);
         var monitor = Screen.FromPoint(cursorPoint);
         var screen = monitor.WorkingArea;
@@ -523,12 +633,9 @@ internal sealed class PopupWindow : Form
             }
             y = Math.Clamp(y, screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge));
         }
-        // Under PerMonitorV2 the first Show() would create the window handle
-        // and reinterpret the requested position through the DPI-adjustment
-        // path, offsetting the popup on scaled displays (e.g. 200%). Creating
-        // the handle up front makes every Location assignment a direct,
-        // unscaled window move, so the very first appearance lands correctly.
-        if (!IsHandleCreated) _ = Handle;
+        // The handle already exists (the constructor forces it), so under
+        // PerMonitorV2 every Location assignment below is a direct, unscaled
+        // window move and the popup lands where it is asked to.
         Location = new Point(x, y);
         UpdateRegion();
         Show();
@@ -542,8 +649,9 @@ internal sealed class PopupWindow : Form
         // The refresh timer calls this every 1.5s even while the popup is
         // visible. A changed process count changes Height - without
         // re-anchoring, the arrow tip would drift by exactly one row height
-        // (20-30px scaled), which is the reported intermittent slip.
-        var oldHeight = Height;
+        // (20-30px scaled), which is the reported intermittent slip. The same
+        // applies to Width, which now follows the widest row.
+        var oldSize = Size;
         var oldLocation = Location;
         var wasVisible = Visible;
         SuspendLayout();
@@ -561,6 +669,18 @@ internal sealed class PopupWindow : Form
             : "nvidia-smi unavailable";
         if (usage.Text != usageText) usage.Text = usageText;
 
+        // Every text is in place, so the content can now be measured for width.
+        var emptyText = data.Available
+            ? "No process data is available from the GPU driver."
+            : "The NVIDIA driver tool did not respond.\nCheck whether nvidia-smi runs from Command Prompt.";
+        if (empty.Text != emptyText) empty.Text = emptyText;
+
+        using (var surface = new MeasuringSurface(DpiScaling.ScaleFactor))
+        {
+            var wantedWidth = MeasureWidth(surface.Graphics);
+            if (wantedWidth != Width) ApplyLayout(surface.Graphics);
+        }
+
         var newBarWidth = (int)Math.Round(barBackground.Width * data.Percent / 100.0);
         if (barFill.Width != newBarWidth) barFill.Width = newBarWidth;
         barFill.Height = barBackground.Height;
@@ -572,10 +692,6 @@ internal sealed class PopupWindow : Form
         {
             processes.Visible = false;
             empty.Visible = true;
-            var emptyText = data.Available
-                ? "No process data is available from the GPU driver."
-                : "The NVIDIA driver tool did not respond.\nCheck whether nvidia-smi runs from Command Prompt.";
-            if (empty.Text != emptyText) empty.Text = emptyText;
             Height = HeaderHeight + empty.Height + DpiScaling.Scale(14) + ArrowHeightScaled;
         }
         else
@@ -609,13 +725,13 @@ internal sealed class PopupWindow : Form
             if (totalProcessHeight > maxContentHeight)
             {
                 processes.AutoScroll = true;
-                processes.Size = new Size(388, maxContentHeight);
+                processes.Size = new Size(ContentWidth, maxContentHeight);
                 Height = HeaderHeight + maxContentHeight + DpiScaling.Scale(14) + ArrowHeightScaled;
             }
             else
             {
                 processes.AutoScroll = false;
-                processes.Size = new Size(388, totalProcessHeight);
+                processes.Size = new Size(ContentWidth, totalProcessHeight);
                 Height = HeaderHeight + totalProcessHeight + DpiScaling.Scale(14) + ArrowHeightScaled;
             }
 
@@ -653,17 +769,24 @@ internal sealed class PopupWindow : Form
         processes.ResumeLayout(true);
         ResumeLayout(true);
 
-        if (wasVisible && IsHandleCreated && Height != oldHeight && !arrowUp)
+        var resized = Height != oldSize.Height || Width != oldSize.Width;
+        if (wasVisible && IsHandleCreated && resized)
         {
-            // Arrow at the bottom: keep the arrow tip pinned by shifting the
-            // top by the height delta so the bottom edge stays where ShowNear
-            // put it. (With the arrow at the top, the top edge is already the
-            // anchor, so growing downward needs no move.)
             var screen = Screen.FromControl(this).WorkingArea;
             var edge = DpiScaling.Scale(6);
-            var newY = oldLocation.Y + (oldHeight - Height);
-            Location = new Point(oldLocation.X,
-                Math.Clamp(newY, screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge)));
+            // A width change must not drift the popup sideways: keep it centred
+            // on the tray icon by moving the left edge by half the width delta.
+            var newX = oldLocation.X + (oldSize.Width - Width) / 2;
+            newX = Math.Clamp(newX, screen.Left + edge, Math.Max(screen.Left + edge, screen.Right - Width - edge));
+            // Arrow at the bottom: keep the arrow tip pinned by shifting the top
+            // by the height delta so the bottom edge stays where ShowNear put it.
+            // (With the arrow at the top the top edge is already the anchor, so
+            // growing downward needs no move.)
+            var newY = arrowUp
+                ? oldLocation.Y
+                : Math.Clamp(oldLocation.Y + (oldSize.Height - Height),
+                    screen.Top + edge, Math.Max(screen.Top + edge, screen.Bottom - Height - edge));
+            Location = new Point(newX, newY);
         }
     }
 
@@ -677,18 +800,32 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     private string memory = string.Empty;
     private int? pid;
     private bool hoverKill;
-    private readonly Font nameFont = new Font("Segoe UI", 9f);
-    private readonly Font memoryFont = new Font("Segoe UI Semibold", 9f);
-    private readonly Font killFont = new Font("Segoe UI", 10f);
+    // Shared static fonts (never disposed: the process outlives every row).
+    // The popup sizes itself to the widest text, and that measurement has to
+    // run against the very same fonts the rows are painted with - a per-row
+    // copy could drift and clip the value it just measured room for.
+    internal static readonly Font NameFont = new("Segoe UI", 9f);
+    internal static readonly Font MemoryFont = new("Segoe UI Semibold", 9f);
+    internal static readonly Font KillFont = new("Segoe UI", 10f);
     private static readonly StringFormat CenterFormat = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
     private static readonly StringFormat NameFormat = new() { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
-    private static readonly StringFormat MemoryFormat = new() { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
+    private static readonly StringFormat MemoryFormat = new()
+    {
+        Alignment = StringAlignment.Far,
+        LineAlignment = StringAlignment.Center,
+        // NoWrap + trimming is a hard guarantee that the unit stays visible.
+        // The default StringFormat (GenericDefault) sets LineLimit, so a value
+        // wider than the column was word-wrapped and the overflow line silently
+        // dropped - the row then read "14" or "120" with no " GB"/" MB" at all.
+        FormatFlags = StringFormatFlags.NoWrap,
+        Trimming = StringTrimming.EllipsisCharacter
+    };
     private Rectangle KillBounds => new(Width - DpiScaling.Scale(32), 0, DpiScaling.Scale(32), Height);
     public event Action? ProcessKilled;
 
     public ProcessRow(GpuProcess process)
     {
-        Size = new Size(388, DpiScaling.Scale(26));
+        Size = new Size(DpiScaling.Scale(388), DpiScaling.Scale(26));
         Margin = Padding.Empty;
         UpdateData(process);
         Paint += OnPaint;
@@ -701,10 +838,15 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     {
         e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
         var killLeft = Width - DpiScaling.Scale(32);
+        // Give the value exactly the width it needs and let the name take the
+        // rest: the popup itself is sized from these same measurements, so the
+        // unit can never be the part that gets squeezed out.
+        var memoryWidth = (int)Math.Ceiling(e.Graphics.MeasureString(memory, MemoryFont).Width) + DpiScaling.Scale(8);
+        var nameWidth = Math.Max(DpiScaling.Scale(80), killLeft - DpiScaling.Scale(6) - memoryWidth);
         using var nameBrush = new SolidBrush(Color.FromArgb(232, 236, 242));
-        e.Graphics.DrawString(name, nameFont, nameBrush, new RectangleF(6, DpiScaling.Scale(4), 246, DpiScaling.Scale(18)), NameFormat);
+        e.Graphics.DrawString(name, NameFont, nameBrush, new RectangleF(DpiScaling.Scale(6), DpiScaling.Scale(4), nameWidth - DpiScaling.Scale(12), DpiScaling.Scale(18)), NameFormat);
         using var memoryBrush = new SolidBrush(Color.FromArgb(150, 202, 255));
-        e.Graphics.DrawString(memory, memoryFont, memoryBrush, new RectangleF(254, DpiScaling.Scale(4), Math.Max(10, killLeft - 6 - 254), DpiScaling.Scale(18)), MemoryFormat);
+        e.Graphics.DrawString(memory, MemoryFont, memoryBrush, new RectangleF(nameWidth, DpiScaling.Scale(4), memoryWidth, DpiScaling.Scale(18)), MemoryFormat);
 
         if (pid is null) return;
 
@@ -715,7 +857,7 @@ internal sealed class ProcessRow : DoubleBufferedPanel
             e.Graphics.FillRectangle(hoverBg, bounds);
         }
         using var killBrush = new SolidBrush(hoverKill ? Color.White : Color.FromArgb(150, 160, 175));
-        e.Graphics.DrawString("✕", killFont, killBrush, bounds, CenterFormat);
+        e.Graphics.DrawString("✕", KillFont, killBrush, bounds, CenterFormat);
     }
 
     private void OnMouseMove(object? sender, MouseEventArgs e)
@@ -756,17 +898,6 @@ internal sealed class ProcessRow : DoubleBufferedPanel
         catch { /* Process already exited or access is denied. */ }
     }
 
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            nameFont.Dispose();
-            memoryFont.Dispose();
-            killFont.Dispose();
-        }
-        base.Dispose(disposing);
-    }
-
     public void UpdateData(GpuProcess process)
     {
         name = process.Name;
@@ -775,6 +906,7 @@ internal sealed class ProcessRow : DoubleBufferedPanel
         Invalidate();
     }
 
-    private static string FormatMemory(int? memoryMiB) =>
+    // Internal so PopupWindow can measure the value before a row exists.
+    internal static string FormatMemory(int? memoryMiB) =>
         memoryMiB is int m ? (m >= 1024 ? $"{m / 1024d:0.#} GB" : $"{m} MB") : "—";
 }

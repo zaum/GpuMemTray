@@ -27,8 +27,12 @@ internal static class NvidiaSmi
                 .Select(ParseProcess).Where(x => x is not null).Cast<GpuProcess>()
                 .OrderByDescending(x => x.MemoryMiB ?? -1).ThenBy(x => x.Name).ToList();
             // NVIDIA's WDDM driver often returns [N/A] for process VRAM. Windows keeps
-            // the same data in its GPU Process Memory performance counter.
-            if (processes.Count == 0 || processes.All(p => p.MemoryMiB is null))
+            // the same data in its GPU Process Memory performance counter. Use it when
+            // *any* row is missing a value, not just when every row is: with a mixed
+            // answer (a value for one app, [N/A] for the next) the partial list was
+            // kept and the [N/A] rows were stuck showing a bare "-" for their whole
+            // lifetime while its neighbours showed a value with a unit.
+            if (processes.Count == 0 || processes.Any(p => p.MemoryMiB is null))
                 processes = ReadWindowsProcessMemory();
             return new GpuSnapshot(memory.Sum(x => x.used), memory.Sum(x => x.total), processes, true);
         }
