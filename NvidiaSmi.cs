@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Microsoft.Win32;
 
 namespace GpuMemTray;
 
@@ -10,6 +9,10 @@ internal static class NvidiaSmi
     // and pops an error dialog that also stalls the shutdown, so every spawn
     // site checks this flag first.
     public static volatile bool SessionEnding;
+    private static DateTime windowsCounterCacheUntil = DateTime.MinValue;
+    private static DateTime windowsCounterBackoffUntil = DateTime.MinValue;
+    private static TimeSpan windowsCounterBackoff = TimeSpan.Zero;
+    private static List<GpuProcess> windowsCounterCache = [];
 
     public static GpuSnapshot Read()
     {
@@ -18,40 +21,38 @@ internal static class NvidiaSmi
         {
             var memoryLines = Run("--query-gpu=memory.used,memory.total --format=csv,noheader,nounits");
             var memory = memoryLines.Select(ParseMemory).Where(x => x is not null).Cast<(int used, int total)>().ToList();
-            if (memory.Count == 0)
-            {
-                // nvidia-smi not available, fall back to the Windows counter.
-                return FallbackSnapshot();
-            }
+            if (memory.Count == 0) return GpuSnapshot.Empty;
             var processes = Run("--query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits")
                 .Select(ParseProcess).Where(x => x is not null).Cast<GpuProcess>()
-                .OrderByDescending(x => x.MemoryMiB ?? -1).ThenBy(x => x.Name).ToList();
-            // NVIDIA's WDDM driver often returns [N/A] for process VRAM. Windows keeps
-            // the same data in its GPU Process Memory performance counter. Use it when
-            // *any* row is missing a value, not just when every row is: with a mixed
-            // answer (a value for one app, [N/A] for the next) the partial list was
-            // kept and the [N/A] rows were stuck showing a bare "-" for their whole
-            // lifetime while its neighbours showed a value with a unit.
-            if (processes.Count == 0 || processes.Any(p => p.MemoryMiB is null))
-                processes = ReadWindowsProcessMemory();
+                .ToList();
+            // WDDM does not expose per-process VRAM through nvidia-smi. Use
+            // Windows' counter only as a visibly marked estimate in that case;
+            // it is known to over-report on some systems and must never affect
+            // the authoritative GPU-wide total above.
+            if (processes.Any(p => p.MemoryMiB is null))
+            {
+                var windowsByPid = ReadWindowsProcessMemory()
+                    .Where(p => p.Pid is not null)
+                    .GroupBy(p => p.Pid!.Value)
+                    .ToDictionary(g => g.Key, g => g.First());
+                processes = processes.Select(p =>
+                {
+                    if (p.MemoryMiB is not null || p.Pid is not int pid || !windowsByPid.TryGetValue(pid, out var estimate)) return p;
+                    return p with
+                    {
+                        MemoryMiB = estimate.MemoryMiB,
+                        IsWindowsEstimate = true,
+                        ExceedsGpuMemory = estimate.MemoryMiB is int value && value > memory.Sum(x => x.total)
+                    };
+                }).ToList();
+            }
+            processes = processes.OrderByDescending(x => x.MemoryMiB ?? -1).ThenBy(x => x.Name).ToList();
             return new GpuSnapshot(memory.Sum(x => x.used), memory.Sum(x => x.total), processes, true);
         }
         catch
         {
-            // If nvidia-smi fails completely, try the Windows counter as fallback.
-            return FallbackSnapshot();
+            return GpuSnapshot.Empty;
         }
-    }
-
-    private static GpuSnapshot FallbackSnapshot()
-    {
-        var processes = ReadWindowsProcessMemory();
-        if (processes.Count == 0) return GpuSnapshot.Empty;
-        var totalUsed = processes.Sum(p => p.MemoryMiB ?? 0);
-        // The Windows counter only knows the per-process usage, so the total
-        // VRAM is read from the registry. When it cannot be determined it
-        // stays 0 and Percent reports 0 instead of a fake 100%.
-        return new GpuSnapshot(totalUsed, TotalVRAMMiB(), processes, true);
     }
 
     private static IEnumerable<string> Run(string arguments)
@@ -106,83 +107,52 @@ internal static class NvidiaSmi
         return new GpuProcess(executable, int.TryParse(memText, out var mib) ? mib : null, int.TryParse(parts[0], out var pid) ? pid : null);
     }
 
-    // Backoff for the performance-counter fallback below: on machines where
-    // Get-Counter hangs (broken counter library, localized builds), each poll
-    // would otherwise spawn a powershell.exe that runs into the 4s timeout and
-    // gets killed - serializing every refresh behind a dead 4s+ wait.
-    private static DateTime lastCounterAttempt = DateTime.MinValue;
-    private static TimeSpan counterBackoff = TimeSpan.Zero;
-
     private static List<GpuProcess> ReadWindowsProcessMemory()
     {
         var now = DateTime.UtcNow;
-        if (now - lastCounterAttempt < counterBackoff) return [];
-        lastCounterAttempt = now;
+        if (now < windowsCounterCacheUntil || now < windowsCounterBackoffUntil) return windowsCounterCache;
+
         const string script = "(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage').CounterSamples | Where-Object {$_.CookedValue -gt 0} | ForEach-Object { '{0}|{1}' -f $_.InstanceName,[math]::Round($_.CookedValue / 1MB) }";
-        var sw = Stopwatch.StartNew();
+        var stopwatch = Stopwatch.StartNew();
         try
         {
-            var result = RunCapture("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 4000)
+            var processes = RunCapture("powershell.exe", $"-NoProfile -NonInteractive -Command \"{script}\"", 5000)
                 .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Select(line => line.Split('|', 2))
                 .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
                 .Select(parts => new { Pid = ParsePid(parts[0]), Memory = int.Parse(parts[1]) })
                 .Where(x => x.Pid is not null)
                 .GroupBy(x => x.Pid!.Value)
-                .Select(group => new GpuProcess(ProcessName(group.Key), group.Sum(x => x.Memory), group.Key))
-                .OrderByDescending(x => x.MemoryMiB).ToList();
-            // A call that only returns near the kill timeout was effectively
-            // hung: back off exponentially (15s, 30s, 60s ... capped at 5min).
-            // Fast calls - even empty ones - reset the backoff immediately.
-            counterBackoff = sw.Elapsed >= TimeSpan.FromMilliseconds(3500)
-                ? NextCounterBackoff()
-                : TimeSpan.Zero;
-            return result;
+                .Select(group => new GpuProcess(ProcessName(group.Key), group.Sum(x => x.Memory), group.Key, true))
+                .ToList();
+
+            if (stopwatch.Elapsed >= TimeSpan.FromMilliseconds(4500))
+            {
+                windowsCounterBackoff = windowsCounterBackoff == TimeSpan.Zero
+                    ? TimeSpan.FromSeconds(15)
+                    : windowsCounterBackoff < TimeSpan.FromMinutes(5)
+                        ? windowsCounterBackoff * 2
+                        : windowsCounterBackoff;
+                windowsCounterBackoffUntil = DateTime.UtcNow + windowsCounterBackoff;
+                return windowsCounterCache;
+            }
+
+            windowsCounterBackoff = TimeSpan.Zero;
+            windowsCounterBackoffUntil = DateTime.MinValue;
+            windowsCounterCache = processes;
+            windowsCounterCacheUntil = DateTime.UtcNow.AddSeconds(3);
+            return windowsCounterCache;
         }
         catch
         {
-            counterBackoff = NextCounterBackoff();
-            return [];
+            windowsCounterBackoff = windowsCounterBackoff == TimeSpan.Zero
+                ? TimeSpan.FromSeconds(15)
+                : windowsCounterBackoff < TimeSpan.FromMinutes(5)
+                    ? windowsCounterBackoff * 2
+                    : windowsCounterBackoff;
+            windowsCounterBackoffUntil = DateTime.UtcNow + windowsCounterBackoff;
+            return windowsCounterCache;
         }
-    }
-
-    private static TimeSpan NextCounterBackoff() =>
-        counterBackoff == TimeSpan.Zero ? TimeSpan.FromSeconds(15)
-        : counterBackoff < TimeSpan.FromMinutes(5) ? counterBackoff * 2
-        : counterBackoff;
-
-    // Reads the dedicated VRAM size of the NVIDIA display adapters from the
-    // registry (HardwareInformation.qwMemorySize). Returns MiB, or 0 when the
-    // value cannot be determined.
-    private static int TotalVRAMMiB()
-    {
-        try
-        {
-            // Display adapter device class; each numeric subkey is one GPU.
-            const string displayClass = @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
-            using var classKey = Registry.LocalMachine.OpenSubKey(displayClass);
-            if (classKey is null) return 0;
-            long totalBytes = 0;
-            foreach (var name in classKey.GetSubKeyNames())
-            {
-                if (!int.TryParse(name, out _)) continue;
-                using var adapterKey = classKey.OpenSubKey(name);
-                if (adapterKey?.GetValue("DriverDesc") as string is not { } description
-                    || !description.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase)) continue;
-                var raw = adapterKey.GetValue("HardwareInformation.qwMemorySize");
-                long bytes = raw switch
-                {
-                    long qword => qword,
-                    int dword => dword,
-                    byte[] binary when binary.Length == sizeof(long) => BitConverter.ToInt64(binary, 0),
-                    _ => 0
-                };
-                totalBytes += bytes;
-            }
-            return (int)Math.Min(totalBytes / (1024 * 1024), int.MaxValue);
-        }
-        catch { /* Unexpected registry layout; treat the total as unknown. */ }
-        return 0;
     }
 
     private static int? ParsePid(string instance)
@@ -196,9 +166,10 @@ internal static class NvidiaSmi
         try { return Process.GetProcessById(pid).ProcessName + ".exe"; }
         catch { return $"PID {pid}"; }
     }
+
 }
 
-internal sealed record GpuProcess(string Name, int? MemoryMiB, int? Pid);
+internal sealed record GpuProcess(string Name, int? MemoryMiB, int? Pid, bool IsWindowsEstimate = false, bool ExceedsGpuMemory = false);
 
 internal sealed record GpuSnapshot(int UsedMiB, int TotalMiB, IReadOnlyList<GpuProcess> Processes, bool Available)
 {

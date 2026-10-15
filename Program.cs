@@ -430,7 +430,7 @@ internal sealed class PopupWindow : Form
             {
                 var row = MeasureText(g, process.Name, ProcessRow.NameFont)
                         + gap
-                        + MeasureText(g, ProcessRow.FormatMemory(process.MemoryMiB), ProcessRow.MemoryFont)
+                        + MeasureText(g, ProcessRow.FormatMemory(process), ProcessRow.MemoryFont)
                         + gap
                         + kill;
                 if (row > value) value = row;
@@ -800,6 +800,9 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     private string memory = string.Empty;
     private int? pid;
     private bool hoverKill;
+    private bool isWindowsEstimate;
+    private string sourceHint = string.Empty;
+    private static readonly ToolTip SourceToolTip = new() { ShowAlways = true, InitialDelay = 450, ReshowDelay = 150 };
     // Shared static fonts (never disposed: the process outlives every row).
     // The popup sizes itself to the widest text, and that measurement has to
     // run against the very same fonts the rows are painted with - a per-row
@@ -845,7 +848,9 @@ internal sealed class ProcessRow : DoubleBufferedPanel
         var nameWidth = Math.Max(DpiScaling.Scale(80), killLeft - DpiScaling.Scale(6) - memoryWidth);
         using var nameBrush = new SolidBrush(Color.FromArgb(232, 236, 242));
         e.Graphics.DrawString(name, NameFont, nameBrush, new RectangleF(DpiScaling.Scale(6), DpiScaling.Scale(4), nameWidth - DpiScaling.Scale(12), DpiScaling.Scale(18)), NameFormat);
-        using var memoryBrush = new SolidBrush(Color.FromArgb(150, 202, 255));
+        using var memoryBrush = new SolidBrush(isWindowsEstimate
+            ? Color.White
+            : Color.FromArgb(150, 202, 255));
         e.Graphics.DrawString(memory, MemoryFont, memoryBrush, new RectangleF(nameWidth, DpiScaling.Scale(4), memoryWidth, DpiScaling.Scale(18)), MemoryFormat);
 
         if (pid is null) return;
@@ -901,7 +906,14 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     public void UpdateData(GpuProcess process)
     {
         name = process.Name;
-        memory = FormatMemory(process.MemoryMiB);
+        memory = FormatMemory(process);
+        isWindowsEstimate = process.IsWindowsEstimate;
+        sourceHint = process.IsWindowsEstimate
+            ? process.ExceedsGpuMemory
+                ? "Windows estimate; this reading exceeds the GPU's total VRAM and is invalid."
+                : "Windows estimate; this counter can be inaccurate."
+            : string.Empty;
+        SourceToolTip.SetToolTip(this, sourceHint);
         pid = process.Pid;
         Invalidate();
     }
@@ -909,4 +921,11 @@ internal sealed class ProcessRow : DoubleBufferedPanel
     // Internal so PopupWindow can measure the value before a row exists.
     internal static string FormatMemory(int? memoryMiB) =>
         memoryMiB is int m ? (m >= 1024 ? $"{m / 1024d:0.#} GB" : $"{m} MB") : "—";
+
+    internal static string FormatMemory(GpuProcess process)
+    {
+        var value = FormatMemory(process.MemoryMiB);
+        if (!process.IsWindowsEstimate || process.MemoryMiB is null) return value;
+        return process.ExceedsGpuMemory ? $"~{value}!" : $"~{value}";
+    }
 }
