@@ -246,6 +246,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr handle, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr handle, uint command);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr handle, out RECT rect);
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern uint RegisterWindowMessage(string message);
@@ -256,6 +262,17 @@ internal static class NativeMethods
 
     public const uint AbeTop = 1;
     public const uint AbeBottom = 3;
+
+    // SetWindowPos insert-after value for the top of the topmost band.
+    public static readonly IntPtr HwndTopMost = new(-1);
+    public const uint SwpNoSize = 0x0001;
+    public const uint SwpNoMove = 0x0002;
+    public const uint SwpNoActivate = 0x0010;
+    public const uint SwpNoOwnerZOrder = 0x0200;
+    public const uint SwpNoSendChanging = 0x0400;
+
+    // GetWindow command used to walk the z-order from the popup upwards.
+    public const uint GwHwndPrev = 3;
 }
 
 internal static class TaskbarInfo

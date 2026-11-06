@@ -13,6 +13,8 @@ Start-Process .\bin\Release\net10.0-windows\publish\GpuMemTray.exe
 
 The application uses `nvidia-smi` (installed by the NVIDIA driver) for total GPU memory. In WDDM mode the driver can return `[N/A]` for per-process memory; in that case the app can show Windows `GPU Process Memory` values as white estimates prefixed with `~`. Windows can over-report these values, so they never affect the GPU-wide total. An estimate above the GPU's total memory is marked with `!`. The right-click menu allows toggling the percentage icon and automatic Windows startup.
 
+The popup always stays above every other window. It is a topmost window and re-raises itself while visible whenever another topmost window (an overlay or floating panel) gets above it, without taking focus from the active window.
+
 ## Display scaling
 
 The popup is as wide as its content needs - the longest application name, the memory value and the header decide it - and it is laid out in logical pixels scaled to the DPI of the monitor it opens on, so it keeps its proportions from 100% to 200% and higher. When Windows sends a DPI-change notification while the popup is open, the geometry and rows are rebuilt for the new scale.

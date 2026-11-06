@@ -71,6 +71,36 @@ remainder - never a fixed split, or the unit is what gets squeezed out.
 Popup height must dynamically adapt to the number of active GPU processes
 without clipping or unnecessary scrollbars.
 
+### Always On Top
+
+The popup must stay above every other window, not merely be marked topmost.
+`WS_EX_TOPMOST` only orders a window inside the topmost band, so another
+topmost window (overlay, floating panel, shell flyout) raised later still
+covers the popup. `PopupWindow.EnsureAboveAll` re-raises it with
+`SetWindowPos(HWND_TOPMOST, ...)` whenever a foreign window sits above it, and
+every show ends with an explicit raise.
+
+Never drop `SWP_NOACTIVATE`: raising the z-order must not steal focus from the
+window the user is working in. Windows of this process (the row tooltips, the
+context menu) and windows that do not overlap the popup's body (the taskbar)
+are skipped by the z-order check, so they never trigger a raise.
+
+### Tray Hover Zone
+
+The popup touches the taskbar and the tray icons are in that strip, so the
+keep-open tolerance (`ContainsCursor`) must not cross the taskbar edge on the
+arrow's side - the neighbouring icons would count as hovering the popup and it
+would never close once the cursor slid along the tray. Only a narrow corridor
+over our own icon cell may enter that strip, to bridge the gap between the
+arrow and the icon. Because the popup now stays reliably on top, such a stale
+tolerance is no longer hidden behind the taskbar.
+
+Keep the icon tolerances tight for the same reason: `IsOverTrayIcon` inflates
+the shell-reported icon rect by 8 logical pixels and the shell-hover fallback
+uses a 10 pixel radius. The neighbouring icons sit about one icon gap (+-16 px)
+away, so the previous 16 pixel values reached them and made the popup appear
+over - or stay open on - the icons on either side.
+
 ### Spacious Row Padding
 
 Process row height must be spacious so rows never overlap or look cramped.

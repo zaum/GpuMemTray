@@ -183,6 +183,10 @@ internal sealed class TrayApplication : ApplicationContext, IMessageFilter
 
         if (popup.Visible)
         {
+            // Another topmost window may have appeared above the popup since
+            // the last tick; put the popup back on top before deciding whether
+            // the cursor still holds it open.
+            popup.EnsureAboveAll();
             if (ContainsCursor(cursor)) { outsideTicks = 0; return; }
             if (++outsideTicks >= 2) { outsideTicks = 0; popup.Hide(); }
             return;
@@ -197,23 +201,42 @@ internal sealed class TrayApplication : ApplicationContext, IMessageFilter
         var padding = DpiScaling.Scale(16);
         var zone = popup.Bounds;
         zone.Inflate(padding, padding);
+        // The popup touches the taskbar, and the tray icons live in that strip.
+        // The tolerance must not spill past the taskbar edge: with the slack
+        // applied on that side, hovering the icons left and right of ours still
+        // counted as hovering the popup (it only became visible once the popup
+        // started staying above the taskbar instead of being pushed behind it).
+        // A couple of pixels keep the zone contiguous with the icon under the
+        // arrow; the corridor below bridges the rest of the way.
+        var taskbarSlack = DpiScaling.Scale(2);
+        zone = popup.PointsUp
+            ? Rectangle.FromLTRB(zone.Left, popup.Bounds.Top - taskbarSlack, zone.Right, zone.Bottom)
+            : Rectangle.FromLTRB(zone.Left, zone.Top, zone.Right, popup.Bounds.Bottom + taskbarSlack);
 
-        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(24)))
+        if (zone.Contains(screenPoint)) return true;
+
+        // Bridge the gap between the arrow and the icon with a corridor exactly
+        // over our own icon cell, so moving between them never closes the popup
+        // while the neighbouring icons stay out of reach.
+        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(8)))
         {
-            zone = Rectangle.Union(zone, iconBounds);
+            // Spans from the popup edge to the icon cell in both directions, so
+            // the bridge is never empty and leaves no dead band between them.
+            var corridorTop = Math.Min(iconBounds.Top, zone.Top);
+            var corridorBottom = Math.Max(iconBounds.Bottom, zone.Bottom);
+            var corridor = Rectangle.FromLTRB(iconBounds.Left, corridorTop, iconBounds.Right, corridorBottom);
+            if (corridor.Contains(screenPoint) || iconBounds.Contains(screenPoint)) return true;
         }
 
-        if (HasRecentShellHover)
-        {
-            zone = Rectangle.Union(zone, ShellHoverZone());
-        }
-
-        return zone.Contains(screenPoint);
+        return HasRecentShellHover && ShellHoverZone().Contains(screenPoint);
     }
 
     private bool IsOverTrayIcon(Point screenPoint)
     {
-        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(16)) && iconBounds.Contains(screenPoint))
+        // Small tolerance on purpose: the neighbouring tray icons sit roughly a
+        // gap away, and a wider slack made hovering them open the popup too.
+        // The shell-hover fallback below still covers an inaccurate icon rect.
+        if (TryGetIconBounds(out var iconBounds, DpiScaling.Scale(8)) && iconBounds.Contains(screenPoint))
         {
             return true;
         }
@@ -229,7 +252,10 @@ internal sealed class TrayApplication : ApplicationContext, IMessageFilter
 
     private Rectangle ShellHoverZone()
     {
-        var radius = DpiScaling.Scale(16);
+        // The shell only reports this point while the cursor is over our own
+        // icon, so a small radius is enough - and it keeps the zone off the
+        // neighbouring icons as the cursor slides along the tray.
+        var radius = DpiScaling.Scale(10);
         return new Rectangle(lastShellHover.X - radius, lastShellHover.Y - radius, radius * 2, radius * 2);
     }
 
@@ -329,6 +355,9 @@ internal sealed class PopupWindow : Form
     // False: arrow at the bottom pointing down (bottom taskbar). True: arrow
     // at the top pointing up (top taskbar or popup below the cursor).
     private bool arrowUp;
+    // Which side of the popup faces the taskbar, i.e. where the hover tolerance
+    // must stop instead of spilling over the tray icons.
+    public bool PointsUp => arrowUp;
     private GpuSnapshot current = GpuSnapshot.Empty;
 
     // Inner width between the paddings, in device pixels. Derived from Width
@@ -482,6 +511,59 @@ internal sealed class PopupWindow : Form
     }
 
     protected override bool ShowWithoutActivation => true;
+
+    // The popup is topmost (WS_EX_TOPMOST), but topmost is only a band inside
+    // the shared z-order: any other topmost window created or raised later - a
+    // game overlay, a floating panel, the shell's own flyouts - lands above it
+    // and hides the popup while the cursor is still on it. While the popup is
+    // visible it therefore re-asserts the top of that band whenever a foreign
+    // window has climbed above it.
+    public void EnsureAboveAll()
+    {
+        if (!IsHandleCreated || !Visible) return;
+        if (!IsForeignWindowAbove()) return;
+        RaiseToTop();
+    }
+
+    // SWP_NOACTIVATE is what makes this safe to call at any time: the z-order
+    // changes without taking focus away from the window the user is working in.
+    // No move and no size either, so it cannot disturb the anchored geometry.
+    private void RaiseToTop() =>
+        NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTopMost, 0, 0, 0, 0,
+            NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate
+            | NativeMethods.SwpNoOwnerZOrder | NativeMethods.SwpNoSendChanging);
+
+    // Walking GW_HWNDPREV from the popup covers every window above it, and
+    // because the popup itself is topmost all of those are topmost too. Three
+    // cases are skipped:
+    // - our own windows: the row tooltips and the context menu are topmost
+    //   windows of this process as well, and pushing the popup above them would
+    //   hide the very hint (or menu) the user is looking at;
+    // - windows that do not overlap the popup's body: the taskbar and the rest
+    //   of the shell's topmost windows merely sit next to it, and treating them
+    //   as a cover would re-raise the popup on every hover tick forever;
+    // - invisible windows, which cannot hide anything.
+    private bool IsForeignWindowAbove()
+    {
+        var body = Bounds;
+        var inset = DpiScaling.Scale(3);
+        body.Inflate(-inset, -inset);
+        if (body.Width <= 0 || body.Height <= 0) return false;
+
+        for (var window = NativeMethods.GetWindow(Handle, NativeMethods.GwHwndPrev);
+             window != IntPtr.Zero;
+             window = NativeMethods.GetWindow(window, NativeMethods.GwHwndPrev))
+        {
+            if (!NativeMethods.IsWindowVisible(window)) continue;
+            NativeMethods.GetWindowThreadProcessId(window, out var windowProcessId);
+            if (windowProcessId == (uint)Environment.ProcessId) continue;
+            if (!NativeMethods.GetWindowRect(window, out var rect)) continue;
+            var bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+            if (bounds.IntersectsWith(body)) return true;
+        }
+        return false;
+    }
+
     protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x08000000 | 0x00000080; return cp; } }
 
     protected override void OnSizeChanged(EventArgs e)
@@ -640,6 +722,9 @@ internal sealed class PopupWindow : Form
         UpdateRegion();
         Show();
         NativeMethods.ShowWindow(Handle, 4); // SW_SHOWNOACTIVATE
+        // Showing without activation does not guarantee the top of the topmost
+        // band, so every show ends with an explicit raise.
+        RaiseToTop();
     }
 
     public void SetSnapshot(GpuSnapshot data)
